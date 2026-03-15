@@ -6,7 +6,7 @@ mod keystroke;
 mod linux;
 
 #[cfg(target_os = "macos")]
-mod mac;
+pub(crate) mod mac;
 
 #[cfg(any(
     all(

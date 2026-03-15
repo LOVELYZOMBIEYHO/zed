@@ -1,3 +1,4 @@
+use super::anica_render::{classify_nv12_surface, draw_surfaces_anica, pixel_format_fourcc};
 use super::metal_atlas::MetalAtlas;
 use crate::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
@@ -15,17 +16,22 @@ use cocoa::{
 use core_foundation::base::TCFType;
 use core_video::{
     metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    CAMetalLayer, CommandQueue, MTLPixelFormat, MTLResourceOptions, NSRange,
+    CAMetalLayer, CommandQueue, MTLPixelFormat, MTLPrimitiveType, MTLResourceOptions, NSRange,
     RenderPassColorAttachmentDescriptorRef,
 };
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem, ptr,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 // Exported to metal
 pub(crate) type PointF = crate::Point<f32>;
@@ -108,7 +114,10 @@ pub(crate) struct MetalRenderer {
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+    polychrome_sprites_anica_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    /// Anica extended surface pipeline with opacity/transform/mask.
+    surfaces_anica_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -117,6 +126,26 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
+}
+
+fn anica_metal_batch_profiler_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    // Keep per-batch renderer profiling opt-in to avoid extra noise by default.
+    *ENABLED.get_or_init(|| {
+        std::env::var("ANICA_GPUI_METAL_BATCH_PROFILER")
+            .map(|value| value != "0")
+            .unwrap_or(false)
+    })
+}
+
+fn anica_renderer_timing_profiler_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    // Renderer-level timing is opt-in; useful for diagnosing drawable stalls.
+    *ENABLED.get_or_init(|| {
+        std::env::var("ANICA_GPUI_RENDERER_TIMING")
+            .map(|value| value != "0")
+            .unwrap_or(false)
+    })
 }
 
 #[repr(C)]
@@ -240,12 +269,29 @@ impl MetalRenderer {
             "polychrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let polychrome_sprites_anica_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "polychrome_sprites_anica",
+            "polychrome_sprite_anica_vertex",
+            "polychrome_sprite_anica_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let surfaces_pipeline_state = build_pipeline_state(
             &device,
             &library,
             "surfaces",
             "surface_vertex",
             "surface_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        // Anica extended surface pipeline (opacity/transform/mask on NV12).
+        let surfaces_anica_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "surfaces_anica",
+            "surface_vertex_anica",
+            "surface_fragment_anica",
             MTLPixelFormat::BGRA8Unorm,
         );
 
@@ -266,7 +312,9 @@ impl MetalRenderer {
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
+            polychrome_sprites_anica_pipeline_state,
             surfaces_pipeline_state,
+            surfaces_anica_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -351,12 +399,15 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        let profile_renderer_timing = anica_renderer_timing_profiler_enabled();
+        let frame_started = Instant::now();
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        let drawable_wait_started = Instant::now();
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -366,12 +417,15 @@ impl MetalRenderer {
             );
             return;
         };
+        let drawable_wait_elapsed = drawable_wait_started.elapsed();
 
         loop {
             let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
 
+            let draw_primitives_started = Instant::now();
             let command_buffer =
                 self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
+            let draw_primitives_elapsed = draw_primitives_started.elapsed();
 
             match command_buffer {
                 Ok(command_buffer) => {
@@ -385,6 +439,7 @@ impl MetalRenderer {
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
 
+                    let present_started = Instant::now();
                     if self.presents_with_transaction {
                         command_buffer.commit();
                         command_buffer.wait_until_scheduled();
@@ -392,6 +447,22 @@ impl MetalRenderer {
                     } else {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
+                    }
+                    let present_elapsed = present_started.elapsed();
+                    let total_elapsed = frame_started.elapsed();
+                    if profile_renderer_timing && total_elapsed >= Duration::from_millis(40) {
+                        log::warn!(
+                            "[GPUI][Renderer] total_ms={} drawable_wait_ms={} draw_primitives_ms={} present_ms={} presents_with_transaction={} batches={} surfaces={} quads={} paths={}",
+                            total_elapsed.as_millis(),
+                            drawable_wait_elapsed.as_millis(),
+                            draw_primitives_elapsed.as_millis(),
+                            present_elapsed.as_millis(),
+                            self.presents_with_transaction,
+                            scene.batches().count(),
+                            scene.surfaces.len(),
+                            scene.quads.len(),
+                            scene.paths.len()
+                        );
                     }
                     return;
                 }
@@ -423,6 +494,20 @@ impl MetalRenderer {
         drawable: &metal::MetalDrawableRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
+        let profile_batches = anica_metal_batch_profiler_enabled();
+        let draw_started = if profile_batches {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let mut shadows_ms = Duration::ZERO;
+        let mut quads_ms = Duration::ZERO;
+        let mut paths_ms = Duration::ZERO;
+        let mut underlines_ms = Duration::ZERO;
+        let mut mono_ms = Duration::ZERO;
+        let mut poly_ms = Duration::ZERO;
+        let mut surfaces_ms = Duration::ZERO;
+
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.layer.is_opaque() { 1. } else { 0. };
@@ -439,20 +524,31 @@ impl MetalRenderer {
         );
 
         for batch in scene.batches() {
-            let ok = match batch {
-                PrimitiveBatch::Shadows(shadows) => self.draw_shadows(
-                    shadows,
-                    instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
-                    command_encoder,
+            let batch_started = if profile_batches {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let (ok, batch_kind): (bool, &'static str) = match batch {
+                PrimitiveBatch::Shadows(shadows) => (
+                    self.draw_shadows(
+                        shadows,
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    "shadows",
                 ),
-                PrimitiveBatch::Quads(quads) => self.draw_quads(
-                    quads,
-                    instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
-                    command_encoder,
+                PrimitiveBatch::Quads(quads) => (
+                    self.draw_quads(
+                        quads,
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    "quads",
                 ),
                 PrimitiveBatch::Paths(paths) => {
                     command_encoder.end_encoding();
@@ -474,7 +570,7 @@ impl MetalRenderer {
                         },
                     );
 
-                    if did_draw {
+                    let ok = if did_draw {
                         self.draw_paths_from_intermediate(
                             paths,
                             instance_buffer,
@@ -484,45 +580,100 @@ impl MetalRenderer {
                         )
                     } else {
                         false
-                    }
+                    };
+                    (ok, "paths")
                 }
-                PrimitiveBatch::Underlines(underlines) => self.draw_underlines(
-                    underlines,
-                    instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
-                    command_encoder,
+                PrimitiveBatch::Underlines(underlines) => (
+                    self.draw_underlines(
+                        underlines,
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    "underlines",
                 ),
                 PrimitiveBatch::MonochromeSprites {
                     texture_id,
                     sprites,
-                } => self.draw_monochrome_sprites(
-                    texture_id,
-                    sprites,
-                    instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
-                    command_encoder,
+                } => (
+                    self.draw_monochrome_sprites(
+                        texture_id,
+                        sprites,
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    "mono",
                 ),
                 PrimitiveBatch::PolychromeSprites {
                     texture_id,
                     sprites,
-                } => self.draw_polychrome_sprites(
+                } => (
+                    self.draw_polychrome_sprites(
+                        texture_id,
+                        sprites,
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    "poly",
+                ),
+                PrimitiveBatch::PolychromeSpritesAnica {
                     texture_id,
                     sprites,
-                    instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
-                    command_encoder,
+                } => (
+                    self.draw_polychrome_sprites_anica(
+                        texture_id,
+                        sprites,
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    "poly_anica",
                 ),
-                PrimitiveBatch::Surfaces(surfaces) => self.draw_surfaces(
-                    surfaces,
-                    instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
-                    command_encoder,
+                PrimitiveBatch::Surfaces(surfaces) => (
+                    self.draw_surfaces(
+                        surfaces,
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    "surfaces",
+                ),
+                // Anica extended NV12 surface batch dispatch.
+                PrimitiveBatch::Surfaces_anica(surfaces) => (
+                    draw_surfaces_anica(
+                        surfaces,
+                        &self.surfaces_anica_pipeline_state,
+                        &self.unit_vertices,
+                        &self.core_video_texture_cache,
+                        &instance_buffer.metal_buffer,
+                        instance_buffer.size,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    "surfaces_anica",
                 ),
             };
+            if let Some(started) = batch_started {
+                let elapsed = started.elapsed();
+                match batch_kind {
+                    "shadows" => shadows_ms += elapsed,
+                    "quads" => quads_ms += elapsed,
+                    "paths" => paths_ms += elapsed,
+                    "underlines" => underlines_ms += elapsed,
+                    "mono" => mono_ms += elapsed,
+                    "poly" => poly_ms += elapsed,
+                    "surfaces" => surfaces_ms += elapsed,
+                    _ => {}
+                }
+            }
             if !ok {
                 command_encoder.end_encoding();
                 anyhow::bail!(
@@ -539,6 +690,30 @@ impl MetalRenderer {
         }
 
         command_encoder.end_encoding();
+
+        if let Some(started) = draw_started {
+            let total = started.elapsed();
+            if total >= Duration::from_millis(40) {
+                log::warn!(
+                    "[GPUI][MetalBatches] total_ms={} shadows_ms={} quads_ms={} paths_ms={} underlines_ms={} mono_ms={} poly_ms={} surfaces_ms={} paths={} shadows={} quads={} underlines={} mono={} poly={} surfaces={}",
+                    total.as_millis(),
+                    shadows_ms.as_millis(),
+                    quads_ms.as_millis(),
+                    paths_ms.as_millis(),
+                    underlines_ms.as_millis(),
+                    mono_ms.as_millis(),
+                    poly_ms.as_millis(),
+                    surfaces_ms.as_millis(),
+                    scene.paths.len(),
+                    scene.shadows.len(),
+                    scene.quads.len(),
+                    scene.underlines.len(),
+                    scene.monochrome_sprites.len(),
+                    scene.polychrome_sprites.len(),
+                    scene.surfaces.len()
+                );
+            }
+        }
 
         instance_buffer.metal_buffer.did_modify_range(NSRange {
             location: 0,
@@ -982,6 +1157,80 @@ impl MetalRenderer {
         true
     }
 
+    fn draw_polychrome_sprites_anica(
+        &self,
+        texture_id: AtlasTextureId,
+        sprites: &[crate::PolychromeSpriteAnica],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        if sprites.is_empty() {
+            return true;
+        }
+        align_offset(instance_offset);
+
+        let texture = self.sprite_atlas.metal_texture(texture_id);
+        let texture_size = size(
+            DevicePixels(texture.width() as i32),
+            DevicePixels(texture.height() as i32),
+        );
+        command_encoder.set_render_pipeline_state(&self.polychrome_sprites_anica_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            SpriteInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            SpriteInputIndex::Sprites as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            SpriteInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_vertex_bytes(
+            SpriteInputIndex::AtlasTextureSize as u64,
+            mem::size_of_val(&texture_size) as u64,
+            &texture_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_buffer(
+            SpriteInputIndex::Sprites as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(&texture));
+
+        let sprite_bytes_len = mem::size_of_val(sprites);
+        let buffer_contents =
+            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
+
+        let next_offset = *instance_offset + sprite_bytes_len;
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                sprites.as_ptr() as *const u8,
+                buffer_contents,
+                sprite_bytes_len,
+            );
+        }
+
+        command_encoder.draw_primitives_instanced(
+            MTLPrimitiveType::Triangle,
+            0,
+            6,
+            sprites.len() as u64,
+        );
+        *instance_offset = next_offset;
+        true
+    }
+
     fn draw_polychrome_sprites(
         &self,
         texture_id: AtlasTextureId,
@@ -1081,11 +1330,15 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_width() as i32),
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
-
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
+            let pixel_format = surface.image_buffer.get_pixel_format();
+            // Accept both macOS NV12 variants (420f/420v) and map them to shader range handling.
+            let Some(surface_kind) = classify_nv12_surface(pixel_format) else {
+                log::warn!(
+                    "[GPUI][Surface] unsupported pixel format={} (0x{pixel_format:08x}), skipping surface draw",
+                    pixel_format_fourcc(pixel_format),
+                );
+                continue;
+            };
 
             let y_texture = self
                 .core_video_texture_cache
@@ -1135,6 +1388,13 @@ impl MetalRenderer {
                 let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
                 Some(metal::TextureRef::from_ptr(texture as *mut _))
             });
+            // Pass color range to the shader so 420f/420v can use different YUV->RGB conversion.
+            let color_range = surface_kind.shader_flag();
+            command_encoder.set_fragment_bytes(
+                SurfaceInputIndex::ColorRange as u64,
+                mem::size_of_val(&color_range) as u64,
+                &color_range as *const u32 as *const _,
+            );
 
             unsafe {
                 let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)
@@ -1333,6 +1593,7 @@ enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+    ColorRange = 6,
 }
 
 #[repr(C)]

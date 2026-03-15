@@ -140,9 +140,12 @@ mod macos {
             "SpriteInputIndex".into(),
             "MonochromeSprite".into(),
             "PolychromeSprite".into(),
+            "PolychromeSpriteAnica".into(),
             "PathSprite".into(),
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
+            "SurfaceBounds_anica".into(),
+            "SurfaceInputIndex_anica".into(),
             "TransformationMatrix".into(),
         ]);
         config.no_includes = true;
@@ -157,6 +160,7 @@ mod macos {
             crate_dir.join("src/window.rs"),
             crate_dir.join("src/platform.rs"),
             crate_dir.join("src/platform/mac/metal_renderer.rs"),
+            crate_dir.join("src/platform/mac/anica_render.rs"),
         ];
         for src_path in src_paths {
             println!("cargo:rerun-if-changed={}", src_path.display());
@@ -295,6 +299,7 @@ mod windows {
             "underline",
             "monochrome_sprite",
             "polychrome_sprite",
+            "polychrome_sprite_anica",
         ];
 
         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);

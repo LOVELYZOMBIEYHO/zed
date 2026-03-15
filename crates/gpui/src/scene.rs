@@ -4,6 +4,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "macos")]
+use crate::platform::mac::anica_render::PaintSurface_anica;
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
@@ -31,7 +33,11 @@ pub(crate) struct Scene {
     pub(crate) underlines: Vec<Underline>,
     pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
     pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
+    pub(crate) polychrome_sprites_anica: Vec<PolychromeSpriteAnica>,
     pub(crate) surfaces: Vec<PaintSurface>,
+    /// Anica extended NV12 surfaces with opacity/transform/mask.
+    #[cfg(target_os = "macos")]
+    pub(crate) surfaces_anica: Vec<PaintSurface_anica>,
 }
 
 impl Scene {
@@ -45,7 +51,10 @@ impl Scene {
         self.underlines.clear();
         self.monochrome_sprites.clear();
         self.polychrome_sprites.clear();
+        self.polychrome_sprites_anica.clear();
         self.surfaces.clear();
+        #[cfg(target_os = "macos")]
+        self.surfaces_anica.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -105,9 +114,18 @@ impl Scene {
                 sprite.order = order;
                 self.polychrome_sprites.push(sprite.clone());
             }
+            Primitive::PolychromeSpriteAnica(sprite) => {
+                sprite.order = order;
+                self.polychrome_sprites_anica.push(sprite.clone());
+            }
             Primitive::Surface(surface) => {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
+            }
+            #[cfg(target_os = "macos")]
+            Primitive::Surface_anica(surface) => {
+                surface.order = order;
+                self.surfaces_anica.push(surface.clone());
             }
         }
         self.paint_operations
@@ -133,7 +151,11 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        self.polychrome_sprites_anica
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        #[cfg(target_os = "macos")]
+        self.surfaces_anica.sort_by_key(|surface| surface.order);
     }
 
     #[cfg_attr(
@@ -163,9 +185,18 @@ impl Scene {
             polychrome_sprites: &self.polychrome_sprites,
             polychrome_sprites_start: 0,
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
+            polychrome_sprites_anica: &self.polychrome_sprites_anica,
+            polychrome_sprites_anica_start: 0,
+            polychrome_sprites_anica_iter: self.polychrome_sprites_anica.iter().peekable(),
             surfaces: &self.surfaces,
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            #[cfg(target_os = "macos")]
+            surfaces_anica: &self.surfaces_anica,
+            #[cfg(target_os = "macos")]
+            surfaces_anica_start: 0,
+            #[cfg(target_os = "macos")]
+            surfaces_anica_iter: self.surfaces_anica.iter().peekable(),
         }
     }
 }
@@ -186,7 +217,12 @@ pub(crate) enum PrimitiveKind {
     Underline,
     MonochromeSprite,
     PolychromeSprite,
+    PolychromeSpriteAnica,
     Surface,
+    /// Anica extended NV12 surface with opacity/transform/mask.
+    #[cfg(target_os = "macos")]
+    #[allow(non_camel_case_types)]
+    Surface_anica,
 }
 
 pub(crate) enum PaintOperation {
@@ -203,7 +239,12 @@ pub(crate) enum Primitive {
     Underline(Underline),
     MonochromeSprite(MonochromeSprite),
     PolychromeSprite(PolychromeSprite),
+    PolychromeSpriteAnica(PolychromeSpriteAnica),
     Surface(PaintSurface),
+    /// Anica extended NV12 surface with opacity/transform/mask.
+    #[cfg(target_os = "macos")]
+    #[allow(non_camel_case_types)]
+    Surface_anica(PaintSurface_anica),
 }
 
 impl Primitive {
@@ -215,7 +256,10 @@ impl Primitive {
             Primitive::Underline(underline) => &underline.bounds,
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
+            Primitive::PolychromeSpriteAnica(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            #[cfg(target_os = "macos")]
+            Primitive::Surface_anica(surface) => &surface.bounds,
         }
     }
 
@@ -227,7 +271,10 @@ impl Primitive {
             Primitive::Underline(underline) => &underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
+            Primitive::PolychromeSpriteAnica(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            #[cfg(target_os = "macos")]
+            Primitive::Surface_anica(surface) => &surface.content_mask,
         }
     }
 }
@@ -258,16 +305,25 @@ struct BatchIterator<'a> {
     polychrome_sprites: &'a [PolychromeSprite],
     polychrome_sprites_start: usize,
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
+    polychrome_sprites_anica: &'a [PolychromeSpriteAnica],
+    polychrome_sprites_anica_start: usize,
+    polychrome_sprites_anica_iter: Peekable<slice::Iter<'a, PolychromeSpriteAnica>>,
     surfaces: &'a [PaintSurface],
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    #[cfg(target_os = "macos")]
+    surfaces_anica: &'a [PaintSurface_anica],
+    #[cfg(target_os = "macos")]
+    surfaces_anica_start: usize,
+    #[cfg(target_os = "macos")]
+    surfaces_anica_iter: Peekable<slice::Iter<'a, PaintSurface_anica>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
     type Item = PrimitiveBatch<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut orders_and_kinds = [
+        let mut orders_and_kinds = vec![
             (
                 self.shadows_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shadow,
@@ -287,10 +343,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 PrimitiveKind::PolychromeSprite,
             ),
             (
+                self.polychrome_sprites_anica_iter.peek().map(|s| s.order),
+                PrimitiveKind::PolychromeSpriteAnica,
+            ),
+            (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
             ),
         ];
+        // Anica extended surfaces participate in draw-order sorting.
+        #[cfg(target_os = "macos")]
+        orders_and_kinds.push((
+            self.surfaces_anica_iter.peek().map(|s| s.order),
+            PrimitiveKind::Surface_anica,
+        ));
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
 
         let first = orders_and_kinds[0];
@@ -404,6 +470,32 @@ impl<'a> Iterator for BatchIterator<'a> {
                     sprites: &self.polychrome_sprites[sprites_start..sprites_end],
                 })
             }
+            PrimitiveKind::PolychromeSpriteAnica => {
+                let texture_id = self
+                    .polychrome_sprites_anica_iter
+                    .peek()
+                    .unwrap()
+                    .tile
+                    .texture_id;
+                let sprites_start = self.polychrome_sprites_anica_start;
+                let mut sprites_end = self.polychrome_sprites_anica_start + 1;
+                self.polychrome_sprites_anica_iter.next();
+                while self
+                    .polychrome_sprites_anica_iter
+                    .next_if(|sprite| {
+                        (sprite.order, batch_kind) < max_order_and_kind
+                            && sprite.tile.texture_id == texture_id
+                    })
+                    .is_some()
+                {
+                    sprites_end += 1;
+                }
+                self.polychrome_sprites_anica_start = sprites_end;
+                Some(PrimitiveBatch::PolychromeSpritesAnica {
+                    texture_id,
+                    sprites: &self.polychrome_sprites_anica[sprites_start..sprites_end],
+                })
+            }
             PrimitiveKind::Surface => {
                 let surfaces_start = self.surfaces_start;
                 let mut surfaces_end = surfaces_start + 1;
@@ -418,6 +510,24 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(
                     &self.surfaces[surfaces_start..surfaces_end],
+                ))
+            }
+            // Anica extended surface batch.
+            #[cfg(target_os = "macos")]
+            PrimitiveKind::Surface_anica => {
+                let start = self.surfaces_anica_start;
+                let mut end = start + 1;
+                self.surfaces_anica_iter.next();
+                while self
+                    .surfaces_anica_iter
+                    .next_if(|surface| (surface.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    end += 1;
+                }
+                self.surfaces_anica_start = end;
+                Some(PrimitiveBatch::Surfaces_anica(
+                    &self.surfaces_anica[start..end],
                 ))
             }
         }
@@ -445,7 +555,15 @@ pub(crate) enum PrimitiveBatch<'a> {
         texture_id: AtlasTextureId,
         sprites: &'a [PolychromeSprite],
     },
+    PolychromeSpritesAnica {
+        texture_id: AtlasTextureId,
+        sprites: &'a [PolychromeSpriteAnica],
+    },
     Surfaces(&'a [PaintSurface]),
+    /// Anica extended NV12 surfaces with opacity/transform/mask.
+    #[cfg(target_os = "macos")]
+    #[allow(non_camel_case_types)]
+    Surfaces_anica(&'a [PaintSurface_anica]),
 }
 
 #[derive(Default, Debug, Clone)]
@@ -608,6 +726,32 @@ impl TransformationMatrix {
         }
         Point::new(output[0].into(), output[1].into())
     }
+
+    /// Compute the inverse transform when the rotation/scale matrix is invertible.
+    pub fn inverse(self) -> Option<Self> {
+        let a = self.rotation_scale[0][0];
+        let b = self.rotation_scale[0][1];
+        let c = self.rotation_scale[1][0];
+        let d = self.rotation_scale[1][1];
+        let det = a * d - b * c;
+        if det.abs() <= 1e-6 {
+            return None;
+        }
+
+        let inv_det = 1.0 / det;
+        let inverse_rotation_scale = [[d * inv_det, -b * inv_det], [-c * inv_det, a * inv_det]];
+        let tx = self.translation[0];
+        let ty = self.translation[1];
+        let inverse_translation = [
+            -(inverse_rotation_scale[0][0] * tx + inverse_rotation_scale[0][1] * ty),
+            -(inverse_rotation_scale[1][0] * tx + inverse_rotation_scale[1][1] * ty),
+        ];
+
+        Some(Self {
+            rotation_scale: inverse_rotation_scale,
+            translation: inverse_translation,
+        })
+    }
 }
 
 impl Default for TransformationMatrix {
@@ -654,6 +798,27 @@ impl From<PolychromeSprite> for Primitive {
 }
 
 #[derive(Clone, Debug)]
+#[repr(C)]
+pub(crate) struct PolychromeSpriteAnica {
+    pub order: DrawOrder,
+    pub pad: u32, // align to 8 bytes
+    pub grayscale: bool,
+    pub opacity: f32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub tile: AtlasTile,
+    pub transformation: TransformationMatrix,
+    pub inverse_transformation: TransformationMatrix,
+}
+
+impl From<PolychromeSpriteAnica> for Primitive {
+    fn from(sprite: PolychromeSpriteAnica) -> Self {
+        Primitive::PolychromeSpriteAnica(sprite)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
@@ -665,6 +830,13 @@ pub(crate) struct PaintSurface {
 impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<PaintSurface_anica> for Primitive {
+    fn from(surface: PaintSurface_anica) -> Self {
+        Primitive::Surface_anica(surface)
     }
 }
 

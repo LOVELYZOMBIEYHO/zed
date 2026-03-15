@@ -47,8 +47,11 @@ use std::{
     path::PathBuf,
     ptr::{self, NonNull},
     rc::Rc,
-    sync::{Arc, Weak},
-    time::Duration,
+    sync::{
+        Arc, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use util::ResultExt;
 
@@ -84,6 +87,65 @@ type NSDragOperation = NSUInteger;
 const NSDragOperationNone: NSDragOperation = 0;
 #[allow(non_upper_case_globals)]
 const NSDragOperationCopy: NSDragOperation = 1;
+
+fn anica_frame_source_profiler_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    // Gate debug profiler logs behind an env var to avoid affecting normal runtime behavior.
+    *ENABLED.get_or_init(|| {
+        std::env::var("ANICA_GPUI_FRAME_PROFILER")
+            .map(|value| value != "0")
+            .unwrap_or(false)
+    })
+}
+
+fn anica_frame_clock_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+fn log_frame_source_interval(source: &'static str) {
+    if !anica_frame_source_profiler_enabled() {
+        return;
+    }
+
+    static STEP_LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static STEP_HITS: AtomicU64 = AtomicU64::new(0);
+    static DISPLAY_LAYER_LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static DISPLAY_LAYER_HITS: AtomicU64 = AtomicU64::new(0);
+
+    let now_ms = anica_frame_clock_ms();
+    let (last_slot, hit_slot) = if source == "display_link_step" {
+        (&STEP_LAST_MS, &STEP_HITS)
+    } else {
+        (&DISPLAY_LAYER_LAST_MS, &DISPLAY_LAYER_HITS)
+    };
+    let prev_ms = last_slot.swap(now_ms, Ordering::Relaxed);
+    let interval_ms = if prev_ms == 0 {
+        0
+    } else {
+        now_ms.saturating_sub(prev_ms)
+    };
+    let hit = hit_slot.fetch_add(1, Ordering::Relaxed) + 1;
+
+    // Log slow frame-source cadence and periodic checkpoints for source attribution.
+    if interval_ms >= 40 || hit % 120 == 0 {
+        if interval_ms >= 40 {
+            log::warn!(
+                "[GPUI][FrameSource] source={} interval_ms={} hit={}",
+                source,
+                interval_ms,
+                hit
+            );
+        } else {
+            log::info!(
+                "[GPUI][FrameSource] source={} interval_ms={} hit={}",
+                source,
+                interval_ms,
+                hit
+            );
+        }
+    }
+}
 #[derive(PartialEq)]
 pub enum UserTabbingPreference {
     Never,
@@ -490,11 +552,17 @@ impl MacWindowState {
         {
             display_link.start().log_err();
             self.display_link = Some(display_link);
+            if anica_frame_source_profiler_enabled() {
+                log::info!("[GPUI][FrameSource] start_display_link display_id={}", display_id);
+            }
         }
     }
 
     fn stop_display_link(&mut self) {
         self.display_link = None;
+        if anica_frame_source_profiler_enabled() {
+            log::info!("[GPUI][FrameSource] stop_display_link");
+        }
     }
 
     fn is_maximized(&self) -> bool {
@@ -2134,6 +2202,7 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
 }
 
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
+    log_frame_source_interval("display_layer");
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
@@ -2141,7 +2210,15 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
         lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);
+        let callback_started = Instant::now();
         callback(Default::default());
+        let callback_elapsed = callback_started.elapsed();
+        if anica_frame_source_profiler_enabled() && callback_elapsed >= Duration::from_millis(10) {
+            log::warn!(
+                "[GPUI][FrameSource] source=display_layer callback_ms={}",
+                callback_elapsed.as_millis()
+            );
+        }
 
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
@@ -2152,13 +2229,22 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
 }
 
 unsafe extern "C" fn step(view: *mut c_void) {
+    log_frame_source_interval("display_link_step");
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
+        let callback_started = Instant::now();
         callback(Default::default());
+        let callback_elapsed = callback_started.elapsed();
+        if anica_frame_source_profiler_enabled() && callback_elapsed >= Duration::from_millis(10) {
+            log::warn!(
+                "[GPUI][FrameSource] source=display_link_step callback_ms={}",
+                callback_elapsed.as_millis()
+            );
+        }
         window_state.lock().request_frame_callback = Some(callback);
     }
 }

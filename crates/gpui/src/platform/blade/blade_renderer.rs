@@ -99,6 +99,14 @@ struct ShaderPolySpritesData {
 }
 
 #[derive(blade_macros::ShaderData)]
+struct ShaderPolySpritesAnicaData {
+    globals: GlobalParams,
+    t_sprite: gpu::TextureView,
+    s_sprite: gpu::Sampler,
+    b_poly_sprites_anica: gpu::BufferPiece,
+}
+
+#[derive(blade_macros::ShaderData)]
 struct ShaderSurfacesData {
     globals: GlobalParams,
     surface_locals: SurfaceParams,
@@ -130,6 +138,7 @@ struct BladePipelines {
     underlines: gpu::RenderPipeline,
     mono_sprites: gpu::RenderPipeline,
     poly_sprites: gpu::RenderPipeline,
+    poly_sprites_anica: gpu::RenderPipeline,
     surfaces: gpu::RenderPipeline,
 }
 
@@ -153,6 +162,7 @@ impl BladePipelines {
         shader.check_struct_size::<Underline>();
         shader.check_struct_size::<MonochromeSprite>();
         shader.check_struct_size::<PolychromeSprite>();
+        shader.check_struct_size::<crate::PolychromeSpriteAnica>();
 
         // See https://apoorvaj.io/alpha-compositing-opengl-blending-and-premultiplied-alpha/
         let blend_mode = match surface_info.alpha {
@@ -286,6 +296,20 @@ impl BladePipelines {
                 color_targets,
                 multisample_state: gpu::MultisampleState::default(),
             }),
+            poly_sprites_anica: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                name: "poly-sprites-anica",
+                data_layouts: &[&ShaderPolySpritesAnicaData::layout()],
+                vertex: shader.at("vs_poly_sprite_anica"),
+                vertex_fetches: &[],
+                primitive: gpu::PrimitiveState {
+                    topology: gpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                fragment: Some(shader.at("fs_poly_sprite_anica")),
+                color_targets,
+                multisample_state: gpu::MultisampleState::default(),
+            }),
             surfaces: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
                 name: "surfaces",
                 data_layouts: &[&ShaderSurfacesData::layout()],
@@ -311,6 +335,7 @@ impl BladePipelines {
         gpu.destroy_render_pipeline(&mut self.underlines);
         gpu.destroy_render_pipeline(&mut self.mono_sprites);
         gpu.destroy_render_pipeline(&mut self.poly_sprites);
+        gpu.destroy_render_pipeline(&mut self.poly_sprites_anica);
         gpu.destroy_render_pipeline(&mut self.surfaces);
     }
 }
@@ -809,6 +834,25 @@ impl BladeRenderer {
                             t_sprite: tex_info.raw_view,
                             s_sprite: self.atlas_sampler,
                             b_poly_sprites: instance_buf,
+                        },
+                    );
+                    encoder.draw(0, 4, 0, sprites.len() as u32);
+                }
+                PrimitiveBatch::PolychromeSpritesAnica {
+                    texture_id,
+                    sprites,
+                } => {
+                    let tex_info = self.atlas.get_texture_info(texture_id);
+                    let instance_buf =
+                        unsafe { self.instance_belt.alloc_typed(sprites, &self.gpu) };
+                    let mut encoder = pass.with(&self.pipelines.poly_sprites_anica);
+                    encoder.bind(
+                        0,
+                        &ShaderPolySpritesAnicaData {
+                            globals,
+                            t_sprite: tex_info.raw_view,
+                            s_sprite: self.atlas_sampler,
+                            b_poly_sprites_anica: instance_buf,
                         },
                     );
                     encoder.draw(0, 4, 0, sprites.len() as u32);

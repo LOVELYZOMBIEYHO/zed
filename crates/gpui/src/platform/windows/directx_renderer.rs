@@ -83,6 +83,7 @@ struct DirectXRenderPipelines {
     underline_pipeline: PipelineState<Underline>,
     mono_sprites: PipelineState<MonochromeSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    poly_sprites_anica: PipelineState<PolychromeSpriteAnica>,
 }
 
 struct DirectXGlobalElements {
@@ -302,6 +303,10 @@ impl DirectXRenderer {
                     texture_id,
                     sprites,
                 } => self.draw_polychrome_sprites(texture_id, sprites),
+                PrimitiveBatch::PolychromeSpritesAnica {
+                    texture_id,
+                    sprites,
+                } => self.draw_polychrome_sprites_anica(texture_id, sprites),
                 PrimitiveBatch::Surfaces(surfaces) => self.draw_surfaces(surfaces),
             }.context(format!("scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                     scene.paths.len(),
@@ -569,6 +574,30 @@ impl DirectXRenderer {
         )
     }
 
+    fn draw_polychrome_sprites_anica(
+        &mut self,
+        texture_id: AtlasTextureId,
+        sprites: &[PolychromeSpriteAnica],
+    ) -> Result<()> {
+        if sprites.is_empty() {
+            return Ok(());
+        }
+        self.pipelines.poly_sprites_anica.update_buffer(
+            &self.devices.device,
+            &self.devices.device_context,
+            sprites,
+        )?;
+        let texture_view = self.atlas.get_texture_view(texture_id);
+        self.pipelines.poly_sprites_anica.draw_with_texture(
+            &self.devices.device_context,
+            &texture_view,
+            &self.resources.viewport,
+            &self.globals.global_params_buffer,
+            &self.globals.sampler,
+            sprites.len() as u32,
+        )
+    }
+
     fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
         if surfaces.is_empty() {
             return Ok(());
@@ -774,6 +803,13 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        let poly_sprites_anica = PipelineState::new(
+            device,
+            "polychrome_sprite_anica_pipeline",
+            ShaderModule::PolychromeSpriteAnica,
+            16,
+            create_blend_state(device)?,
+        )?;
 
         Ok(Self {
             shadow_pipeline,
@@ -783,6 +819,7 @@ impl DirectXRenderPipelines {
             underline_pipeline,
             mono_sprites,
             poly_sprites,
+            poly_sprites_anica,
         })
     }
 }
@@ -1409,6 +1446,7 @@ pub(crate) mod shader_resources {
         PathSprite,
         MonochromeSprite,
         PolychromeSprite,
+        PolychromeSpriteAnica,
         EmojiRasterization,
     }
 
@@ -1478,6 +1516,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::PolychromeSpriteAnica => match target {
+                    ShaderTarget::Vertex => POLYCHROME_SPRITE_ANICA_VERTEX_BYTES,
+                    ShaderTarget::Fragment => POLYCHROME_SPRITE_ANICA_FRAGMENT_BYTES,
                 },
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
@@ -1568,6 +1610,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::PathSprite => "path_sprite",
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::PolychromeSpriteAnica => "polychrome_sprite_anica",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }

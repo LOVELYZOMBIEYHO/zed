@@ -87,6 +87,9 @@ use key_dispatch::*;
 pub use keymap::*;
 pub use path_builder::*;
 pub use platform::*;
+/// Re-export anica extended surface params for external crate access.
+#[cfg(target_os = "macos")]
+pub use platform::mac::anica_render::SurfaceExParams_anica;
 pub use refineable::*;
 pub use scene::*;
 pub use shared_string::*;

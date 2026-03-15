@@ -9,14 +9,15 @@ use crate::{
     KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
     LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PromptButton, PromptLevel, Quad,
-    Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PolychromeSpriteAnica,
+    PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
+    Style, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement, TransformationMatrix, Underline,
+    UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls,
+    WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems,
+    size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -59,6 +60,16 @@ use crate::util::atomic_incr_if_not_zero;
 pub use prompts::*;
 
 pub(crate) const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(864.));
+
+fn anica_frame_breakdown_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Keep this profiler opt-in so release behavior is unchanged unless explicitly enabled.
+    *ENABLED.get_or_init(|| {
+        std::env::var("ANICA_GPUI_FRAME_BREAKDOWN")
+            .map(|value| value != "0")
+            .unwrap_or(false)
+    })
+}
 
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
@@ -1023,8 +1034,14 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let last_input_timestamp = last_input_timestamp.clone();
             move |request_frame_options| {
+                let frame_started = Instant::now();
+                let mut next_callbacks_elapsed = Duration::ZERO;
+                let mut draw_or_render_elapsed = Duration::ZERO;
+                let mut present_only_elapsed = Duration::ZERO;
                 let next_frame_callbacks = next_frame_callbacks.take();
+                let next_frame_callback_count = next_frame_callbacks.len();
                 if !next_frame_callbacks.is_empty() {
+                    let callbacks_started = Instant::now();
                     handle
                         .update(&mut cx, |_, window, cx| {
                             for callback in next_frame_callbacks {
@@ -1032,16 +1049,19 @@ impl Window {
                             }
                         })
                         .log_err();
+                    next_callbacks_elapsed = callbacks_started.elapsed();
                 }
 
                 // Keep presenting the current scene for 1 extra second since the
                 // last input to prevent the display from underclocking the refresh rate.
-                let needs_present = request_frame_options.require_presentation
+                let needs_present_now = request_frame_options.require_presentation
                     || needs_present.get()
                     || (active.get()
                         && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
+                let should_render = invalidator.is_dirty() || request_frame_options.force_render;
 
-                if invalidator.is_dirty() || request_frame_options.force_render {
+                if should_render {
+                    let draw_started = Instant::now();
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1051,18 +1071,39 @@ impl Window {
                                 arena_clear_needed.clear();
                             })
                             .log_err();
-                    })
-                } else if needs_present {
+                    });
+                    draw_or_render_elapsed = draw_started.elapsed();
+                } else if needs_present_now {
+                    let present_started = Instant::now();
                     handle
                         .update(&mut cx, |_, window, _| window.present())
                         .log_err();
+                    present_only_elapsed = present_started.elapsed();
                 }
 
+                let complete_started = Instant::now();
                 handle
                     .update(&mut cx, |_, window, _| {
                         window.complete_frame();
                     })
                     .log_err();
+                let complete_frame_elapsed = complete_started.elapsed();
+
+                let frame_total = frame_started.elapsed();
+                if anica_frame_breakdown_enabled() && frame_total >= Duration::from_millis(40) {
+                    log::warn!(
+                        "[GPUI][FrameBreakdown] total_ms={} callbacks_ms={} draw_ms={} present_ms={} complete_ms={} callbacks={} render={} needs_present={} force_render={}",
+                        frame_total.as_millis(),
+                        next_callbacks_elapsed.as_millis(),
+                        draw_or_render_elapsed.as_millis(),
+                        present_only_elapsed.as_millis(),
+                        complete_frame_elapsed.as_millis(),
+                        next_frame_callback_count,
+                        should_render,
+                        needs_present_now,
+                        request_frame_options.force_render
+                    );
+                }
             }
         }));
         platform_window.on_resize(Box::new({
@@ -3174,6 +3215,67 @@ impl Window {
         Ok(())
     }
 
+    /// Paint an image into the scene using the additive anica transform path.
+    /// Keeps the existing `paint_image` behaviour intact while allowing transformed
+    /// image rendering to live on a separate primitive/pipeline.
+    pub fn paint_image_anica(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        transformation: TransformationMatrix,
+    ) -> Result<()> {
+        if transformation == TransformationMatrix::unit() {
+            return self.paint_image(bounds, corner_radii, data, frame_index, grayscale);
+        }
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let params = RenderImageParams {
+            image_id: data.id,
+            frame_index,
+        };
+
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(&params.into(), &mut || {
+                Ok(Some((
+                    data.size(frame_index),
+                    Cow::Borrowed(
+                        data.as_bytes(frame_index)
+                            .expect("It's the caller's job to pass a valid frame index"),
+                    ),
+                )))
+            })?
+            .expect("Callback above only returns Some");
+        let content_mask = self.content_mask().scale(scale_factor);
+        let corner_radii = corner_radii.scale(scale_factor);
+        let opacity = self.element_opacity();
+        let inverse_transformation = transformation.inverse().unwrap_or_default();
+
+        self.next_frame
+            .scene
+            .insert_primitive(PolychromeSpriteAnica {
+                order: 0,
+                pad: 0,
+                grayscale,
+                bounds: bounds
+                    .map_origin(|origin| origin.floor())
+                    .map_size(|size| size.ceil()),
+                content_mask,
+                corner_radii,
+                tile,
+                opacity,
+                transformation,
+                inverse_transformation,
+            });
+        Ok(())
+    }
+
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -3191,6 +3293,31 @@ impl Window {
             bounds,
             content_mask,
             image_buffer,
+        });
+    }
+
+    /// Paint an extended NV12 surface with opacity/transform/mask (anica).
+    /// Uses the zero-copy NV12 path with GPU-side effects, no BGRA fallback.
+    #[cfg(target_os = "macos")]
+    pub fn paint_surface_anica(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_buffer: CVPixelBuffer,
+        params: crate::platform::mac::anica_render::SurfaceExParams_anica,
+    ) {
+        use crate::platform::mac::anica_render::PaintSurface_anica;
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        self.next_frame.scene.insert_primitive(PaintSurface_anica {
+            order: 0,
+            bounds,
+            content_mask,
+            image_buffer,
+            params,
         });
     }
 

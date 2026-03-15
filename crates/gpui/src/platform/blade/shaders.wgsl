@@ -139,6 +139,11 @@ struct TransformationMatrix {
     translation: vec2<f32>,
 }
 
+fn apply_transformation_anica(position: vec2<f32>, transform: TransformationMatrix) -> vec2<f32> {
+    // Rust side stores the 2x2 matrix row-major, so transpose before applying.
+    return transpose(transform.rotation_scale) * position + transform.translation;
+}
+
 fn to_device_position_impl(position: vec2<f32>) -> vec4<f32> {
     let device_position = position / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
     return vec4<f32>(device_position, 0.0, 1.0);
@@ -151,8 +156,14 @@ fn to_device_position(unit_vertex: vec2<f32>, bounds: Bounds) -> vec4<f32> {
 
 fn to_device_position_transformed(unit_vertex: vec2<f32>, bounds: Bounds, transform: TransformationMatrix) -> vec4<f32> {
     let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
-    //Note: Rust side stores it as row-major, so transposing here
+    // Note: Rust side stores it as row-major, so transpose before applying.
     let transformed = transpose(transform.rotation_scale) * position + transform.translation;
+    return to_device_position_impl(transformed);
+}
+
+fn to_device_position_transformed_anica(unit_vertex: vec2<f32>, bounds: Bounds, transform: TransformationMatrix) -> vec4<f32> {
+    let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
+    let transformed = apply_transformation_anica(position, transform);
     return to_device_position_impl(transformed);
 }
 
@@ -175,6 +186,12 @@ fn distance_from_clip_rect(unit_vertex: vec2<f32>, bounds: Bounds, clip_bounds: 
 fn distance_from_clip_rect_transformed(unit_vertex: vec2<f32>, bounds: Bounds, clip_bounds: Bounds, transform: TransformationMatrix) -> vec4<f32> {
     let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
     let transformed = transpose(transform.rotation_scale) * position + transform.translation;
+    return distance_from_clip_rect_impl(transformed, clip_bounds);
+}
+
+fn distance_from_clip_rect_transformed_anica(unit_vertex: vec2<f32>, bounds: Bounds, clip_bounds: Bounds, transform: TransformationMatrix) -> vec4<f32> {
+    let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
+    let transformed = apply_transformation_anica(position, transform);
     return distance_from_clip_rect_impl(transformed, clip_bounds);
 }
 
@@ -1169,11 +1186,11 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     let sprite = b_mono_sprites[instance_id];
 
     var out = MonoSpriteVarying();
-    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
+    out.position = to_device_position_transformed_anica(unit_vertex, sprite.bounds, sprite.transformation);
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
-    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.clip_distances = distance_from_clip_rect_transformed_anica(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     return out;
 }
 
@@ -1205,6 +1222,20 @@ struct PolychromeSprite {
 }
 var<storage, read> b_poly_sprites: array<PolychromeSprite>;
 
+struct PolychromeSpriteAnica {
+    order: u32,
+    pad: u32,
+    grayscale: u32,
+    opacity: f32,
+    bounds: Bounds,
+    content_mask: Bounds,
+    corner_radii: Corners,
+    tile: AtlasTile,
+    transformation: TransformationMatrix,
+    inverse_transformation: TransformationMatrix,
+}
+var<storage, read> b_poly_sprites_anica: array<PolychromeSpriteAnica>;
+
 struct PolySpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
@@ -1235,6 +1266,46 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 
     let sprite = b_poly_sprites[input.sprite_id];
     let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+
+    var color = sample;
+    if ((sprite.grayscale & 0xFFu) != 0u) {
+        let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
+        color = vec4<f32>(vec3<f32>(grayscale), sample.a);
+    }
+    return blend_color(color, sprite.opacity * saturate(0.5 - distance));
+}
+
+struct PolySpriteAnicaVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) tile_position: vec2<f32>,
+    @location(1) @interpolate(flat) sprite_id: u32,
+    @location(3) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_poly_sprite_anica(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> PolySpriteAnicaVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let sprite = b_poly_sprites_anica[instance_id];
+
+    var out = PolySpriteAnicaVarying();
+    out.position = to_device_position_transformed_anica(unit_vertex, sprite.bounds, sprite.transformation);
+    out.tile_position = to_tile_position(unit_vertex, sprite.tile);
+    out.sprite_id = instance_id;
+    out.clip_distances =
+        distance_from_clip_rect_transformed_anica(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    return out;
+}
+
+@fragment
+fn fs_poly_sprite_anica(input: PolySpriteAnicaVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let sprite = b_poly_sprites_anica[input.sprite_id];
+    let local_position = apply_transformation_anica(input.position.xy, sprite.inverse_transformation);
+    let distance = quad_sdf(local_position, sprite.bounds, sprite.corner_radii);
 
     var color = sample;
     if ((sprite.grayscale & 0xFFu) != 0u) {

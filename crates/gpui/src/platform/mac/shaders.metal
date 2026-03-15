@@ -10,7 +10,11 @@ float4 srgb_to_oklab(float4 color);
 float4 oklab_to_srgb(float4 color);
 float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
                           constant Size_DevicePixels *viewport_size);
+float2 apply_transformation_anica(float2 position, TransformationMatrix transformation);
 float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                          TransformationMatrix transformation,
+                          constant Size_DevicePixels *input_viewport_size);
+float4 to_device_position_transformed_anica(float2 unit_vertex, Bounds_ScaledPixels bounds,
                           TransformationMatrix transformation,
                           constant Size_DevicePixels *input_viewport_size);
 
@@ -19,6 +23,8 @@ float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
 float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds);
 float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                               Bounds_ScaledPixels clip_bounds, TransformationMatrix transformation);
+float4 distance_from_clip_rect_transformed_anica(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds, TransformationMatrix transformation);
 float corner_dash_velocity(float dv1, float dv2);
 float dash_alpha(float t, float period, float length, float dash_velocity,
@@ -630,8 +636,8 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   MonochromeSprite sprite = sprites[sprite_id];
   float4 device_position =
-      to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
-  float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
+      to_device_position_transformed_anica(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
+  float4 clip_distance = distance_from_clip_rect_transformed_anica(unit_vertex, sprite.bounds,
                                                  sprite.content_mask.bounds, sprite.transformation);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
   float4 color = hsla_to_rgba(sprite.color);
@@ -684,7 +690,8 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   PolychromeSprite sprite = sprites[sprite_id];
   float4 device_position =
-      to_device_position(unit_vertex, sprite.bounds, viewport_size);
+        to_device_position(unit_vertex, sprite.bounds, viewport_size);
+
   float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
                                                  sprite.content_mask.bounds);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
@@ -704,8 +711,70 @@ fragment float4 polychrome_sprite_fragment(
                                           min_filter::linear);
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
-  float distance =
+float distance =
       quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+
+  float4 color = sample;
+  if (sprite.grayscale) {
+    float grayscale = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+    color.r = grayscale;
+    color.g = grayscale;
+    color.b = grayscale;
+  }
+  color.a *= sprite.opacity * saturate(0.5 - distance);
+  return color;
+}
+
+struct PolychromeSpriteAnicaVertexOutput {
+  float4 position [[position]];
+  float2 tile_position;
+  uint sprite_id [[flat]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct PolychromeSpriteAnicaFragmentInput {
+  float4 position [[position]];
+  float2 tile_position;
+  uint sprite_id [[flat]];
+};
+
+vertex PolychromeSpriteAnicaVertexOutput polychrome_sprite_anica_vertex(
+    uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
+    constant PolychromeSpriteAnica *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(SpriteInputIndex_ViewportSize)]],
+    constant Size_DevicePixels *atlas_size
+    [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
+
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  PolychromeSpriteAnica sprite = sprites[sprite_id];
+  float4 device_position =
+        to_device_position_transformed_anica(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
+
+  float4 clip_distance = distance_from_clip_rect_transformed_anica(unit_vertex, sprite.bounds,
+                                                 sprite.content_mask.bounds, sprite.transformation);
+  float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+  return PolychromeSpriteAnicaVertexOutput{
+      device_position,
+      tile_position,
+      sprite_id,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 polychrome_sprite_anica_fragment(
+    PolychromeSpriteAnicaFragmentInput input [[stage_in]],
+    constant PolychromeSpriteAnica *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
+  PolychromeSpriteAnica sprite = sprites[input.sprite_id];
+  constexpr sampler atlas_texture_sampler(mag_filter::linear,
+                                          min_filter::linear);
+  float4 sample =
+      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  float2 local_position =
+      apply_transformation_anica(input.position.xy, sprite.inverse_transformation);
+  float distance =
+      quad_sdf(local_position, sprite.bounds, sprite.corner_radii);
 
   float4 color = sample;
   if (sprite.grayscale) {
@@ -872,18 +941,158 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
-                                 [[texture(SurfaceInputIndex_CbCrTexture)]]) {
+                                 [[texture(SurfaceInputIndex_CbCrTexture)]],
+                                 constant uint *color_range
+                                 [[buffer(SurfaceInputIndex_ColorRange)]]) {
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
-  const float4x4 ycbcrToRGBTransform =
+  // Use full-range matrix for 420f and limited-range matrix for 420v.
+  float4x4 ycbcrToRGBTransform;
+  if (*color_range == 0u) {
+    ycbcrToRGBTransform =
       float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
                float4(+0.0000f, -0.3441f, +1.7720f, +0.0000f),
                float4(+1.4020f, -0.7141f, +0.0000f, +0.0000f),
                float4(-0.7010f, +0.5291f, -0.8860f, +1.0000f));
+  } else {
+    ycbcrToRGBTransform =
+      float4x4(float4(+1.1644f, +1.1644f, +1.1644f, +0.0000f),
+               float4(+0.0000f, -0.3918f, +2.0172f, +0.0000f),
+               float4(+1.5960f, -0.8130f, +0.0000f, +0.0000f),
+               float4(-0.8742f, +0.5317f, -1.0856f, +1.0000f));
+  }
   float4 ycbcr = float4(
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
   return ycbcrToRGBTransform * ycbcr;
+}
+
+// ─── Anica extended surface shaders (opacity / transform / mask) ────────
+// SurfaceBounds_anica and SurfaceInputIndex_anica are auto-generated
+// by cbindgen from anica_render.rs — do not redefine here.
+
+struct SurfaceVertexOutput_anica {
+  float4 position [[position]];
+  float2 texture_position;
+  float clip_distance [[clip_distance]][4];
+};
+
+struct SurfaceFragmentInput_anica {
+  float4 position [[position]];
+  float2 texture_position;
+};
+
+// Vertex shader for extended NV12 surface (anica).
+// Applies scale, rotation, and translation in normalised device coords.
+vertex SurfaceVertexOutput_anica surface_vertex_anica(
+    uint unit_vertex_id [[vertex_id]], uint surface_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(SurfaceInputIndex_Vertices)]],
+    constant SurfaceBounds_anica *surfaces [[buffer(SurfaceInputIndex_Surfaces)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(SurfaceInputIndex_ViewportSize)]],
+    constant Size_DevicePixels *texture_size
+    [[buffer(SurfaceInputIndex_TextureSize)]]) {
+
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  SurfaceBounds_anica surface = surfaces[surface_id];
+
+  // Base device position (same as original surface_vertex).
+  float viewport_width = float(viewport_size->width);
+  float viewport_height = float(viewport_size->height);
+
+  // Compute centre of the surface bounds in pixel coords.
+  float cx = surface.bounds.origin.x + surface.bounds.size.width * 0.5;
+  float cy = surface.bounds.origin.y + surface.bounds.size.height * 0.5;
+
+  // Pixel position of this vertex before transform.
+  float px = surface.bounds.origin.x + unit_vertex.x * surface.bounds.size.width;
+  float py = surface.bounds.origin.y + unit_vertex.y * surface.bounds.size.height;
+
+  // Apply scale around centre.
+  float dx = (px - cx) * surface.scale;
+  float dy = (py - cy) * surface.scale;
+
+  // Apply rotation around centre.
+  float cos_r = cos(surface.rotation_rad);
+  float sin_r = sin(surface.rotation_rad);
+  float rx = dx * cos_r - dy * sin_r;
+  float ry = dx * sin_r + dy * cos_r;
+
+  // Final pixel position with translation.
+  float fx = cx + rx + surface.translate_x;
+  float fy = cy + ry + surface.translate_y;
+
+  // Convert to normalised device coordinates.
+  float4 device_position = float4(
+      fx / viewport_width * 2.0 - 1.0,
+      1.0 - fy / viewport_height * 2.0,
+      0.0, 1.0);
+
+  // Clip against the content mask in transformed screen space so rotated
+  // surfaces cannot bleed outside the preview panel.
+  float4 clip_distance = float4(
+      fx - surface.content_mask.bounds.origin.x,
+      surface.content_mask.bounds.origin.x +
+          surface.content_mask.bounds.size.width - fx,
+      fy - surface.content_mask.bounds.origin.y,
+      surface.content_mask.bounds.origin.y +
+          surface.content_mask.bounds.size.height - fy);
+  float2 texture_position = unit_vertex;
+
+  return SurfaceVertexOutput_anica{
+      device_position,
+      texture_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+// Fragment shader for extended NV12 surface (anica).
+// Same YCbCr→RGB as original, but multiplies alpha by opacity.
+fragment float4 surface_fragment_anica(
+    SurfaceFragmentInput_anica input [[stage_in]],
+    texture2d<float> y_texture
+    [[texture(SurfaceInputIndex_YTexture)]],
+    texture2d<float> cb_cr_texture
+    [[texture(SurfaceInputIndex_CbCrTexture)]],
+    constant uint *color_range
+    [[buffer(SurfaceInputIndex_ColorRange)]],
+    constant SurfaceBounds_anica *surfaces
+    [[buffer(SurfaceInputIndex_Surfaces)]]) {
+
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+
+  // Early discard: skip fragments outside the original quad UV bounds.
+  // When the quad is rotated, the rasterised bounding box is larger than the
+  // actual quad. These extra fragments have UV outside [0,1] and produce
+  // clamped-edge artefacts. Discarding them saves the full YCbCr→RGB
+  // conversion work, reducing fragment cost by ~50% at 45° rotation.
+  if (input.texture_position.x < 0.0 || input.texture_position.x > 1.0 ||
+      input.texture_position.y < 0.0 || input.texture_position.y > 1.0) {
+    discard_fragment();
+  }
+
+  // Select full-range or limited-range YUV→RGB matrix.
+  float4x4 ycbcrToRGBTransform;
+  if (*color_range == 0u) {
+    ycbcrToRGBTransform =
+      float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
+               float4(+0.0000f, -0.3441f, +1.7720f, +0.0000f),
+               float4(+1.4020f, -0.7141f, +0.0000f, +0.0000f),
+               float4(-0.7010f, +0.5291f, -0.8860f, +1.0000f));
+  } else {
+    ycbcrToRGBTransform =
+      float4x4(float4(+1.1644f, +1.1644f, +1.1644f, +0.0000f),
+               float4(+0.0000f, -0.3918f, +2.0172f, +0.0000f),
+               float4(+1.5960f, -0.8130f, +0.0000f, +0.0000f),
+               float4(-0.8742f, +0.5317f, -1.0856f, +1.0000f));
+  }
+  float4 ycbcr = float4(
+      y_texture.sample(texture_sampler, input.texture_position).r,
+      cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
+
+  float4 rgb = ycbcrToRGBTransform * ycbcr;
+  // Apply opacity to the alpha channel.
+  rgb.a = surfaces[0].opacity;
+  return rgb;
 }
 
 float4 hsla_to_rgba(Hsla hsla) {
@@ -1019,6 +1228,30 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bo
   return float4(device_position, 0., 1.);
 }
 
+float2 apply_transformation_anica(float2 position, TransformationMatrix transformation) {
+  float2 transformed_position = float2(0, 0);
+  transformed_position[0] = position[0] * transformation.rotation_scale[0][0] + position[1] * transformation.rotation_scale[0][1];
+  transformed_position[1] = position[0] * transformation.rotation_scale[1][0] + position[1] * transformation.rotation_scale[1][1];
+  transformed_position[0] += transformation.translation[0];
+  transformed_position[1] += transformation.translation[1];
+  return transformed_position;
+}
+
+float4 to_device_position_transformed_anica(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                          TransformationMatrix transformation,
+                          constant Size_DevicePixels *input_viewport_size) {
+  float2 position =
+      unit_vertex * float2(bounds.size.width, bounds.size.height) +
+      float2(bounds.origin.x, bounds.origin.y);
+  float2 transformed_position = apply_transformation_anica(position, transformation);
+
+  float2 viewport_size = float2((float)input_viewport_size->width,
+                                (float)input_viewport_size->height);
+  float2 device_position =
+      transformed_position / viewport_size * float2(2., -2.) + float2(-1., 1.);
+  return float4(device_position, 0., 1.);
+}
+
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size) {
@@ -1121,6 +1354,19 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixe
   transformed_position[1] = position[0] * transformation.rotation_scale[1][0] + position[1] * transformation.rotation_scale[1][1];
   transformed_position[0] += transformation.translation[0];
   transformed_position[1] += transformation.translation[1];
+
+  return float4(transformed_position.x - clip_bounds.origin.x,
+                clip_bounds.origin.x + clip_bounds.size.width - transformed_position.x,
+                transformed_position.y - clip_bounds.origin.y,
+                clip_bounds.origin.y + clip_bounds.size.height - transformed_position.y);
+}
+
+float4 distance_from_clip_rect_transformed_anica(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                               Bounds_ScaledPixels clip_bounds, TransformationMatrix transformation) {
+  float2 position =
+      unit_vertex * float2(bounds.size.width, bounds.size.height) +
+      float2(bounds.origin.x, bounds.origin.y);
+  float2 transformed_position = apply_transformation_anica(position, transformation);
 
   return float4(transformed_position.x - clip_bounds.origin.x,
                 clip_bounds.origin.x + clip_bounds.size.width - transformed_position.x,

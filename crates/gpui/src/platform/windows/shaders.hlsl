@@ -113,6 +113,25 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds bounds, Bo
     return distance_from_clip_rect_impl(transformed, clip_bounds);
 }
 
+float2 apply_transformation_anica(float2 position, TransformationMatrix transformation) {
+    return mul(position, transformation.rotation_scale) + transformation.translation;
+}
+
+float4 to_device_position_transformed_anica(float2 unit_vertex, Bounds bounds,
+                                            TransformationMatrix transformation) {
+    float2 position = unit_vertex * bounds.size + bounds.origin;
+    float2 transformed = apply_transformation_anica(position, transformation);
+    float2 device_position = transformed / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    return float4(device_position, 0.0, 1.0);
+}
+
+float4 distance_from_clip_rect_transformed_anica(float2 unit_vertex, Bounds bounds,
+                                                 Bounds clip_bounds, TransformationMatrix transformation) {
+    float2 position = unit_vertex * bounds.size + bounds.origin;
+    float2 transformed = apply_transformation_anica(position, transformation);
+    return distance_from_clip_rect_impl(transformed, clip_bounds);
+}
+
 // Convert linear RGB to sRGB
 float3 linear_to_srgb(float3 color) {
     return pow(color, float3(2.2, 2.2, 2.2));
@@ -1136,6 +1155,19 @@ struct PolychromeSprite {
     AtlasTile tile;
 };
 
+struct PolychromeSpriteAnica {
+    uint order;
+    uint pad;
+    uint grayscale;
+    float opacity;
+    Bounds bounds;
+    Bounds content_mask;
+    Corners corner_radii;
+    AtlasTile tile;
+    TransformationMatrix transformation;
+    TransformationMatrix inverse_transformation;
+};
+
 struct PolychromeSpriteVertexOutput {
     nointerpolation uint sprite_id: TEXCOORD0;
     float4 position: SV_Position;
@@ -1171,6 +1203,52 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     PolychromeSprite sprite = poly_sprites[input.sprite_id];
     float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
     float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+
+    float4 color = sample;
+    if ((sprite.grayscale & 0xFFu) != 0u) {
+        float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
+        color = float4(grayscale, sample.a);
+    }
+    color.a *= sprite.opacity * saturate(0.5 - distance);
+    return color;
+}
+
+struct PolychromeSpriteAnicaVertexOutput {
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 tile_position: POSITION;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct PolychromeSpriteAnicaFragmentInput {
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 tile_position: POSITION;
+};
+
+StructuredBuffer<PolychromeSpriteAnica> poly_sprites_anica: register(t1);
+
+PolychromeSpriteAnicaVertexOutput polychrome_sprite_anica_vertex(uint vertex_id: SV_VertexID, uint sprite_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    PolychromeSpriteAnica sprite = poly_sprites_anica[sprite_id];
+    float4 device_position = to_device_position_transformed_anica(unit_vertex, sprite.bounds, sprite.transformation);
+    float4 clip_distance = distance_from_clip_rect_transformed_anica(unit_vertex, sprite.bounds,
+                                                          sprite.content_mask, sprite.transformation);
+    float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
+
+    PolychromeSpriteAnicaVertexOutput output;
+    output.position = device_position;
+    output.tile_position = tile_position;
+    output.sprite_id = sprite_id;
+    output.clip_distance = clip_distance;
+    return output;
+}
+
+float4 polychrome_sprite_anica_fragment(PolychromeSpriteAnicaFragmentInput input): SV_Target {
+    PolychromeSpriteAnica sprite = poly_sprites_anica[input.sprite_id];
+    float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
+    float2 local_position = apply_transformation_anica(input.position.xy, sprite.inverse_transformation);
+    float distance = quad_sdf(local_position, sprite.bounds, sprite.corner_radii);
 
     float4 color = sample;
     if ((sprite.grayscale & 0xFFu) != 0u) {
