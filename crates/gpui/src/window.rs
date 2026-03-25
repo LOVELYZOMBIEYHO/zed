@@ -3309,6 +3309,9 @@ impl Window {
 
         self.invalidator.debug_assert_paint();
 
+        let mut params = params;
+        params.opacity = (params.opacity * self.element_opacity()).clamp(0.0, 1.0);
+
         let scale_factor = self.scale_factor();
         let bounds = bounds.scale(scale_factor);
         let content_mask = self.content_mask().scale(scale_factor);

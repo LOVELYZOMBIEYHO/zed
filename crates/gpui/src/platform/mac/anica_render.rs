@@ -2,7 +2,7 @@
 // =========================================
 // crates/gpui-0.2.2-anica-edition/src/platform/mac/anica_render.rs
 
-use crate::{Bounds, ContentMask, DevicePixels, ScaledPixels, Size, size};
+use crate::{size, Bounds, ContentMask, DevicePixels, ScaledPixels, Size};
 use core_foundation::base::TCFType;
 use core_video::{
     metal_texture::CVMetalTextureGetTexture,
@@ -203,6 +203,13 @@ pub(crate) fn draw_surfaces_anica(
             Some(instance_buffer_metal),
             *instance_offset as u64,
         );
+        // Fragment shader reads `surfaces[0].opacity`, so bind the same instance
+        // buffer for fragment stage as well.
+        command_encoder.set_fragment_buffer(
+            SurfaceInputIndex_anica::Surfaces as u64,
+            Some(instance_buffer_metal),
+            *instance_offset as u64,
+        );
         command_encoder.set_vertex_bytes(
             SurfaceInputIndex_anica::TextureSize as u64,
             mem::size_of_val(&texture_size) as u64,
@@ -212,13 +219,10 @@ pub(crate) fn draw_surfaces_anica(
             let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
             Some(metal::TextureRef::from_ptr(texture as *mut _))
         });
-        command_encoder.set_fragment_texture(
-            SurfaceInputIndex_anica::CbCrTexture as u64,
-            unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            },
-        );
+        command_encoder.set_fragment_texture(SurfaceInputIndex_anica::CbCrTexture as u64, unsafe {
+            let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+            Some(metal::TextureRef::from_ptr(texture as *mut _))
+        });
         // Pass color range flag for YUV->RGB matrix selection.
         let color_range = surface_kind.shader_flag();
         command_encoder.set_fragment_bytes(
@@ -232,7 +236,8 @@ pub(crate) fn draw_surfaces_anica(
 
         unsafe {
             let buffer_contents = (instance_buffer_metal.contents() as *mut u8)
-                .add(*instance_offset) as *mut SurfaceBounds_anica;
+                .add(*instance_offset)
+                as *mut SurfaceBounds_anica;
             ptr::write(
                 buffer_contents,
                 SurfaceBounds_anica {
