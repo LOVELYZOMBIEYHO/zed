@@ -4,10 +4,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "windows")]
+use crate::platform::anica_render::PaintBgraFrame_anica;
 #[cfg(target_os = "macos")]
 use crate::platform::mac::anica_render::PaintSurface_anica;
-#[cfg(target_os = "windows")]
-use crate::platform::windows::anica_render::PaintBgraFrame_anica;
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,

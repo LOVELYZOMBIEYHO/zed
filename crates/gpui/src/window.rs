@@ -3359,10 +3359,10 @@ impl Window {
     pub fn paint_bgra_frame_anica(
         &mut self,
         bounds: Bounds<Pixels>,
-        surface: crate::platform::windows::anica_render::BgraFrameSurface,
-        params: crate::platform::windows::anica_render::SurfaceExParams_anica,
+        surface: crate::platform::anica_render::BgraFrameSurface,
+        params: crate::platform::anica_render::SurfaceExParams_anica,
     ) {
-        use crate::platform::windows::anica_render::PaintBgraFrame_anica;
+        use crate::platform::anica_render::PaintBgraFrame_anica;
 
         self.invalidator.debug_assert_paint();
         if !surface.is_bgra() {
