@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
 use crate::platform::mac::anica_render::PaintSurface_anica;
+#[cfg(target_os = "windows")]
+use crate::platform::windows::anica_render::PaintBgraFrame_anica;
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
@@ -38,6 +40,9 @@ pub(crate) struct Scene {
     /// Anica extended NV12 surfaces with opacity/transform/mask.
     #[cfg(target_os = "macos")]
     pub(crate) surfaces_anica: Vec<PaintSurface_anica>,
+    /// Anica native Windows BGRA video frames.
+    #[cfg(target_os = "windows")]
+    pub(crate) bgra_frames_anica: Vec<PaintBgraFrame_anica>,
 }
 
 impl Scene {
@@ -55,6 +60,8 @@ impl Scene {
         self.surfaces.clear();
         #[cfg(target_os = "macos")]
         self.surfaces_anica.clear();
+        #[cfg(target_os = "windows")]
+        self.bgra_frames_anica.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -127,6 +134,11 @@ impl Scene {
                 surface.order = order;
                 self.surfaces_anica.push(surface.clone());
             }
+            #[cfg(target_os = "windows")]
+            Primitive::BgraFrame_anica(frame) => {
+                frame.order = order;
+                self.bgra_frames_anica.push(frame.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -156,6 +168,8 @@ impl Scene {
         self.surfaces.sort_by_key(|surface| surface.order);
         #[cfg(target_os = "macos")]
         self.surfaces_anica.sort_by_key(|surface| surface.order);
+        #[cfg(target_os = "windows")]
+        self.bgra_frames_anica.sort_by_key(|frame| frame.order);
     }
 
     #[cfg_attr(
@@ -197,6 +211,12 @@ impl Scene {
             surfaces_anica_start: 0,
             #[cfg(target_os = "macos")]
             surfaces_anica_iter: self.surfaces_anica.iter().peekable(),
+            #[cfg(target_os = "windows")]
+            bgra_frames_anica: &self.bgra_frames_anica,
+            #[cfg(target_os = "windows")]
+            bgra_frames_anica_start: 0,
+            #[cfg(target_os = "windows")]
+            bgra_frames_anica_iter: self.bgra_frames_anica.iter().peekable(),
         }
     }
 }
@@ -223,6 +243,10 @@ pub(crate) enum PrimitiveKind {
     #[cfg(target_os = "macos")]
     #[allow(non_camel_case_types)]
     Surface_anica,
+    /// Anica native Windows BGRA video frame.
+    #[cfg(target_os = "windows")]
+    #[allow(non_camel_case_types)]
+    BgraFrame_anica,
 }
 
 pub(crate) enum PaintOperation {
@@ -245,6 +269,10 @@ pub(crate) enum Primitive {
     #[cfg(target_os = "macos")]
     #[allow(non_camel_case_types)]
     Surface_anica(PaintSurface_anica),
+    /// Anica native Windows BGRA video frame.
+    #[cfg(target_os = "windows")]
+    #[allow(non_camel_case_types)]
+    BgraFrame_anica(PaintBgraFrame_anica),
 }
 
 impl Primitive {
@@ -260,6 +288,8 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.bounds,
             #[cfg(target_os = "macos")]
             Primitive::Surface_anica(surface) => &surface.bounds,
+            #[cfg(target_os = "windows")]
+            Primitive::BgraFrame_anica(frame) => &frame.bounds,
         }
     }
 
@@ -275,6 +305,8 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.content_mask,
             #[cfg(target_os = "macos")]
             Primitive::Surface_anica(surface) => &surface.content_mask,
+            #[cfg(target_os = "windows")]
+            Primitive::BgraFrame_anica(frame) => &frame.content_mask,
         }
     }
 }
@@ -317,6 +349,12 @@ struct BatchIterator<'a> {
     surfaces_anica_start: usize,
     #[cfg(target_os = "macos")]
     surfaces_anica_iter: Peekable<slice::Iter<'a, PaintSurface_anica>>,
+    #[cfg(target_os = "windows")]
+    bgra_frames_anica: &'a [PaintBgraFrame_anica],
+    #[cfg(target_os = "windows")]
+    bgra_frames_anica_start: usize,
+    #[cfg(target_os = "windows")]
+    bgra_frames_anica_iter: Peekable<slice::Iter<'a, PaintBgraFrame_anica>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -356,6 +394,11 @@ impl<'a> Iterator for BatchIterator<'a> {
         orders_and_kinds.push((
             self.surfaces_anica_iter.peek().map(|s| s.order),
             PrimitiveKind::Surface_anica,
+        ));
+        #[cfg(target_os = "windows")]
+        orders_and_kinds.push((
+            self.bgra_frames_anica_iter.peek().map(|frame| frame.order),
+            PrimitiveKind::BgraFrame_anica,
         ));
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
 
@@ -530,6 +573,24 @@ impl<'a> Iterator for BatchIterator<'a> {
                     &self.surfaces_anica[start..end],
                 ))
             }
+            // Anica Windows native BGRA frame batch.
+            #[cfg(target_os = "windows")]
+            PrimitiveKind::BgraFrame_anica => {
+                let start = self.bgra_frames_anica_start;
+                let mut end = start + 1;
+                self.bgra_frames_anica_iter.next();
+                while self
+                    .bgra_frames_anica_iter
+                    .next_if(|frame| (frame.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    end += 1;
+                }
+                self.bgra_frames_anica_start = end;
+                Some(PrimitiveBatch::BgraFrames_anica(
+                    &self.bgra_frames_anica[start..end],
+                ))
+            }
         }
     }
 }
@@ -564,6 +625,10 @@ pub(crate) enum PrimitiveBatch<'a> {
     #[cfg(target_os = "macos")]
     #[allow(non_camel_case_types)]
     Surfaces_anica(&'a [PaintSurface_anica]),
+    /// Anica native Windows BGRA video frames.
+    #[cfg(target_os = "windows")]
+    #[allow(non_camel_case_types)]
+    BgraFrames_anica(&'a [PaintBgraFrame_anica]),
 }
 
 #[derive(Default, Debug, Clone)]
@@ -837,6 +902,13 @@ impl From<PaintSurface> for Primitive {
 impl From<PaintSurface_anica> for Primitive {
     fn from(surface: PaintSurface_anica) -> Self {
         Primitive::Surface_anica(surface)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl From<PaintBgraFrame_anica> for Primitive {
+    fn from(frame: PaintBgraFrame_anica) -> Self {
+        Primitive::BgraFrame_anica(frame)
     }
 }
 

@@ -86,10 +86,15 @@ pub use interactive::*;
 use key_dispatch::*;
 pub use keymap::*;
 pub use path_builder::*;
-pub use platform::*;
 /// Re-export anica extended surface params for external crate access.
 #[cfg(target_os = "macos")]
-pub use platform::mac::anica_render::SurfaceExParams_anica;
+pub use platform::mac::anica_render::{BgraFrameSurface, SurfaceExParams_anica};
+/// Re-export anica Windows BGRA frame params for external crate access.
+#[cfg(target_os = "windows")]
+pub use platform::windows::anica_render::{
+    BgraFrameSurface, D3d11Devices_anica, SurfaceExParams_anica,
+};
+pub use platform::*;
 pub use refineable::*;
 pub use scene::*;
 pub use shared_string::*;

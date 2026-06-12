@@ -1,4 +1,6 @@
-use super::anica_render::{classify_nv12_surface, draw_surfaces_anica, pixel_format_fourcc};
+use super::anica_render::{
+    SurfaceTextureKind, classify_surface_texture, draw_surfaces_anica, pixel_format_fourcc,
+};
 use super::metal_atlas::MetalAtlas;
 use crate::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
@@ -1331,8 +1333,8 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
             let pixel_format = surface.image_buffer.get_pixel_format();
-            // Accept both macOS NV12 variants (420f/420v) and map them to shader range handling.
-            let Some(surface_kind) = classify_nv12_surface(pixel_format) else {
+            // Accept supported CoreVideo surface formats and map them to shader source handling.
+            let Some(surface_kind) = classify_surface_texture(pixel_format) else {
                 log::warn!(
                     "[GPUI][Surface] unsupported pixel format={} (0x{pixel_format:08x}), skipping surface draw",
                     pixel_format_fourcc(pixel_format),
@@ -1340,28 +1342,48 @@ impl MetalRenderer {
                 continue;
             };
 
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
-                    0,
-                )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
-                    1,
-                )
-                .unwrap();
+            // Build Metal texture views without copying the IOSurface-backed CVPixelBuffer.
+            let texture_pair = match surface_kind {
+                SurfaceTextureKind::Nv12(_) => {
+                    let y_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            surface.image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::R8Unorm,
+                            surface.image_buffer.get_width_of_plane(0),
+                            surface.image_buffer.get_height_of_plane(0),
+                            0,
+                        )
+                        .unwrap();
+                    let cb_cr_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            surface.image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::RG8Unorm,
+                            surface.image_buffer.get_width_of_plane(1),
+                            surface.image_buffer.get_height_of_plane(1),
+                            1,
+                        )
+                        .unwrap();
+                    (y_texture, cb_cr_texture)
+                }
+                SurfaceTextureKind::Bgra => {
+                    let texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            surface.image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::BGRA8Unorm,
+                            surface.image_buffer.get_width(),
+                            surface.image_buffer.get_height(),
+                            0,
+                        )
+                        .unwrap();
+                    (texture.clone(), texture)
+                }
+            };
 
             align_offset(instance_offset);
             let next_offset = *instance_offset + mem::size_of::<Surface>();
@@ -1381,14 +1403,14 @@ impl MetalRenderer {
             );
             // let y_texture = y_texture.get_texture().unwrap().
             command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+                let texture = CVMetalTextureGetTexture(texture_pair.0.as_concrete_TypeRef());
                 Some(metal::TextureRef::from_ptr(texture as *mut _))
             });
             command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+                let texture = CVMetalTextureGetTexture(texture_pair.1.as_concrete_TypeRef());
                 Some(metal::TextureRef::from_ptr(texture as *mut _))
             });
-            // Pass color range to the shader so 420f/420v can use different YUV->RGB conversion.
+            // Pass source layout/range to the shader for BGRA or NV12 conversion.
             let color_range = surface_kind.shader_flag();
             command_encoder.set_fragment_bytes(
                 SurfaceInputIndex::ColorRange as u64,

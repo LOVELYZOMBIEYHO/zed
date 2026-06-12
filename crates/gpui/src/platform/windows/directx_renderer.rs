@@ -20,6 +20,9 @@ use windows::{
 };
 
 use crate::{
+    platform::windows::anica_render::{
+        BgraFrameBounds_anica, D3d11Devices_anica, PaintBgraFrame_anica,
+    },
     platform::windows::directx_renderer::shader_resources::{
         RawShaderBytes, ShaderModule, ShaderTarget,
     },
@@ -84,6 +87,7 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
     poly_sprites_anica: PipelineState<PolychromeSpriteAnica>,
+    bgra_frames_anica: PipelineState<BgraFrameBounds_anica>,
 }
 
 struct DirectXGlobalElements {
@@ -170,6 +174,13 @@ impl DirectXRenderer {
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.atlas.clone()
+    }
+
+    pub(crate) fn d3d11_devices_anica(&self) -> D3d11Devices_anica {
+        D3d11Devices_anica {
+            device: self.devices.device.clone(),
+            device_context: self.devices.device_context.clone(),
+        }
     }
 
     fn pre_draw(&self) -> Result<()> {
@@ -307,6 +318,7 @@ impl DirectXRenderer {
                     texture_id,
                     sprites,
                 } => self.draw_polychrome_sprites_anica(texture_id, sprites),
+                PrimitiveBatch::BgraFrames_anica(frames) => self.draw_bgra_frames_anica(frames),
                 PrimitiveBatch::Surfaces(surfaces) => self.draw_surfaces(surfaces),
             }.context(format!("scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                     scene.paths.len(),
@@ -605,6 +617,53 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    fn draw_bgra_frames_anica(&mut self, frames: &[PaintBgraFrame_anica]) -> Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+
+        for frame in frames {
+            let instance = [BgraFrameBounds_anica {
+                bounds: frame.bounds,
+                content_mask: frame.content_mask.clone(),
+                opacity: frame.params.opacity,
+                scale: frame.params.scale,
+                rotation_rad: frame.params.rotation_deg.to_radians(),
+                _pad: 0.0,
+                translate_x: frame.params.translate.x.0,
+                translate_y: frame.params.translate.y.0,
+            }];
+
+            self.pipelines.bgra_frames_anica.update_buffer(
+                &self.devices.device,
+                &self.devices.device_context,
+                &instance,
+            )?;
+
+            let mut texture_view = None;
+            unsafe {
+                self.devices
+                    .device
+                    .CreateShaderResourceView(
+                        frame.surface.texture(),
+                        None,
+                        Some(&mut texture_view),
+                    )
+                    .context("Creating BGRA frame shader resource view")?;
+            }
+            let texture_view = [Some(texture_view.unwrap())];
+            self.pipelines.bgra_frames_anica.draw_with_texture(
+                &self.devices.device_context,
+                &texture_view,
+                &self.resources.viewport,
+                &self.globals.global_params_buffer,
+                &self.globals.sampler,
+                1,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
         let desc = unsafe { self.devices.adapter.GetDesc1() }?;
         let is_software_emulated = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0;
@@ -810,6 +869,13 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        let bgra_frames_anica = PipelineState::new(
+            device,
+            "bgra_frame_anica_pipeline",
+            ShaderModule::BgraFrameAnica,
+            4,
+            create_blend_state(device)?,
+        )?;
 
         Ok(Self {
             shadow_pipeline,
@@ -820,6 +886,7 @@ impl DirectXRenderPipelines {
             mono_sprites,
             poly_sprites,
             poly_sprites_anica,
+            bgra_frames_anica,
         })
     }
 }
@@ -1447,6 +1514,7 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         PolychromeSprite,
         PolychromeSpriteAnica,
+        BgraFrameAnica,
         EmojiRasterization,
     }
 
@@ -1520,6 +1588,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSpriteAnica => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_ANICA_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_ANICA_FRAGMENT_BYTES,
+                },
+                ShaderModule::BgraFrameAnica => match target {
+                    ShaderTarget::Vertex => BGRA_FRAME_ANICA_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BGRA_FRAME_ANICA_FRAGMENT_BYTES,
                 },
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
@@ -1611,6 +1683,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::PolychromeSpriteAnica => "polychrome_sprite_anica",
+                ShaderModule::BgraFrameAnica => "bgra_frame_anica",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }

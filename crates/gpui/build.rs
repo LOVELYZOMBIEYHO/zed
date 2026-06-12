@@ -300,6 +300,7 @@ mod windows {
             "monochrome_sprite",
             "polychrome_sprite",
             "polychrome_sprite_anica",
+            "bgra_frame_anica",
         ];
 
         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);

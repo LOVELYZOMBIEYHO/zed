@@ -1,12 +1,12 @@
 //! Macos screen have a y axis that goings up from the bottom of the screen and
 //! an origin at the bottom left of the main display.
+#[allow(non_camel_case_types)]
+pub(crate) mod anica_render;
 mod dispatcher;
 mod display;
 mod display_link;
 mod events;
 mod keyboard;
-#[allow(non_camel_case_types)]
-pub(crate) mod anica_render;
 
 #[cfg(feature = "screen-capture")]
 mod screen_capture;

@@ -1258,3 +1258,66 @@ float4 polychrome_sprite_anica_fragment(PolychromeSpriteAnicaFragmentInput input
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              Anica BGRA video frames
+**
+*/
+
+struct BgraFrameAnica {
+    Bounds bounds;
+    Bounds content_mask;
+    float opacity;
+    float scale;
+    float rotation_rad;
+    float pad;
+    float translate_x;
+    float translate_y;
+};
+
+struct BgraFrameAnicaVertexOutput {
+    nointerpolation uint frame_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_position: TEXCOORD1;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct BgraFrameAnicaFragmentInput {
+    nointerpolation uint frame_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_position: TEXCOORD1;
+};
+
+StructuredBuffer<BgraFrameAnica> bgra_frames_anica: register(t1);
+
+BgraFrameAnicaVertexOutput bgra_frame_anica_vertex(uint vertex_id: SV_VertexID, uint frame_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    BgraFrameAnica frame = bgra_frames_anica[frame_id];
+
+    float2 center = frame.bounds.origin + frame.bounds.size * 0.5;
+    float2 pixel_position = frame.bounds.origin + unit_vertex * frame.bounds.size;
+    float2 delta = (pixel_position - center) * frame.scale;
+
+    float cos_r = cos(frame.rotation_rad);
+    float sin_r = sin(frame.rotation_rad);
+    float2 rotated = float2(
+        delta.x * cos_r - delta.y * sin_r,
+        delta.x * sin_r + delta.y * cos_r
+    );
+    float2 final_position = center + rotated + float2(frame.translate_x, frame.translate_y);
+
+    BgraFrameAnicaVertexOutput output;
+    output.position = to_device_position_impl(final_position);
+    output.texture_position = unit_vertex;
+    output.frame_id = frame_id;
+    output.clip_distance = distance_from_clip_rect_impl(final_position, frame.content_mask);
+    return output;
+}
+
+float4 bgra_frame_anica_fragment(BgraFrameAnicaFragmentInput input): SV_Target {
+    BgraFrameAnica frame = bgra_frames_anica[input.frame_id];
+    float4 color = t_sprite.Sample(s_sprite, input.texture_position);
+    color.a *= frame.opacity;
+    return color;
+}

@@ -853,6 +853,10 @@ impl PlatformWindow for WindowsWindow {
         self.0.hwnd
     }
 
+    fn d3d11_devices_anica(&self) -> Option<D3d11Devices_anica> {
+        Some(self.0.state.borrow().renderer.d3d11_devices_anica())
+    }
+
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.0.state.borrow().renderer.gpu_specs().log_err()
     }

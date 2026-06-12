@@ -2,13 +2,13 @@
 // =========================================
 // crates/gpui-0.2.2-anica-edition/src/platform/mac/anica_render.rs
 
-use crate::{size, Bounds, ContentMask, DevicePixels, ScaledPixels, Size};
+use crate::{Bounds, ContentMask, DevicePixels, ScaledPixels, Size, size};
 use core_foundation::base::TCFType;
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture,
+    metal_texture::{CVMetalTexture, CVMetalTextureGetTexture},
     metal_texture_cache::CVMetalTextureCache,
     pixel_buffer::{
-        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
     },
 };
@@ -33,6 +33,23 @@ impl Nv12SurfaceKind {
     }
 }
 
+/// Identifies all CoreVideo formats supported by the surface renderer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SurfaceTextureKind {
+    Nv12(Nv12SurfaceKind),
+    Bgra,
+}
+
+impl SurfaceTextureKind {
+    /// Encodes the source texture layout for the shared surface fragment shader.
+    pub(crate) fn shader_flag(self) -> u32 {
+        match self {
+            Self::Nv12(kind) => kind.shader_flag(),
+            Self::Bgra => 2,
+        }
+    }
+}
+
 /// Classifies supported NV12 pixel formats (420f/420v) for surface rendering.
 pub(crate) fn classify_nv12_surface(pixel_format: u32) -> Option<Nv12SurfaceKind> {
     if pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
@@ -41,6 +58,15 @@ pub(crate) fn classify_nv12_surface(pixel_format: u32) -> Option<Nv12SurfaceKind
         Some(Nv12SurfaceKind::VideoRange)
     } else {
         None
+    }
+}
+
+/// Classifies CoreVideo pixel formats accepted by GPUI surface rendering.
+pub(crate) fn classify_surface_texture(pixel_format: u32) -> Option<SurfaceTextureKind> {
+    if pixel_format == kCVPixelFormatType_32BGRA {
+        Some(SurfaceTextureKind::Bgra)
+    } else {
+        classify_nv12_surface(pixel_format).map(SurfaceTextureKind::Nv12)
     }
 }
 
@@ -61,8 +87,8 @@ pub(crate) fn pixel_format_fourcc(pixel_format: u32) -> String {
 
 // ─── Anica extended surface rendering ───────────────────────────────────
 
-/// Extended surface parameters for NV12 zero-copy rendering with
-/// opacity, transform, and mask support — eliminating BGRA fallback.
+/// Extended surface parameters for CoreVideo surface rendering with
+/// opacity, transform, and mask support.
 #[derive(Clone, Debug)]
 pub struct SurfaceExParams_anica {
     /// Overall opacity [0.0 .. 1.0].
@@ -89,7 +115,7 @@ impl Default for SurfaceExParams_anica {
     }
 }
 
-/// Scene primitive for the extended NV12 surface path (anica).
+/// Scene primitive for the extended CoreVideo surface path (anica).
 #[derive(Clone, Debug)]
 pub(crate) struct PaintSurface_anica {
     pub order: crate::scene::DrawOrder,
@@ -97,6 +123,34 @@ pub(crate) struct PaintSurface_anica {
     pub content_mask: ContentMask<ScaledPixels>,
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
     pub params: SurfaceExParams_anica,
+}
+
+/// Platform-native BGRA frame storage used by `paint_bgra_frame_anica`.
+#[derive(Clone, Debug)]
+pub enum BgraFrameSurface {
+    /// A macOS CoreVideo BGRA pixel buffer.
+    CvPixelBuffer(core_video::pixel_buffer::CVPixelBuffer),
+}
+
+impl BgraFrameSurface {
+    /// Returns true when the wrapped platform surface is a BGRA pixel buffer.
+    pub fn is_bgra(&self) -> bool {
+        match self {
+            Self::CvPixelBuffer(buffer) => buffer.get_pixel_format() == kCVPixelFormatType_32BGRA,
+        }
+    }
+
+    pub(crate) fn pixel_format(&self) -> u32 {
+        match self {
+            Self::CvPixelBuffer(buffer) => buffer.get_pixel_format(),
+        }
+    }
+
+    pub(crate) fn into_cv_pixel_buffer(self) -> core_video::pixel_buffer::CVPixelBuffer {
+        match self {
+            Self::CvPixelBuffer(buffer) => buffer,
+        }
+    }
 }
 
 /// GPU instance data written into the Metal instance buffer for
@@ -128,7 +182,17 @@ pub(crate) enum SurfaceInputIndex_anica {
     ColorRange = 6,
 }
 
-/// Draws extended NV12 surfaces with opacity / transform / mask support.
+enum SurfaceMetalTextures {
+    Nv12 {
+        y_texture: CVMetalTexture,
+        cb_cr_texture: CVMetalTexture,
+    },
+    Bgra {
+        texture: CVMetalTexture,
+    },
+}
+
+/// Draws extended CoreVideo surfaces with opacity / transform / mask support.
 /// All custom rendering logic lives here to keep GPUI core files minimal.
 pub(crate) fn draw_surfaces_anica(
     surfaces: &[PaintSurface_anica],
@@ -159,8 +223,8 @@ pub(crate) fn draw_surfaces_anica(
             DevicePixels::from(surface.image_buffer.get_height() as i32),
         );
         let pixel_format = surface.image_buffer.get_pixel_format();
-        // Classify NV12 variant (420f / 420v).
-        let Some(surface_kind) = classify_nv12_surface(pixel_format) else {
+        // Classify the source buffer so NV12 and BGRA can share the surface path.
+        let Some(surface_kind) = classify_surface_texture(pixel_format) else {
             log::warn!(
                 "[GPUI][SurfaceAnica] unsupported pixel format={} (0x{pixel_format:08x}), skipping",
                 pixel_format_fourcc(pixel_format),
@@ -168,27 +232,48 @@ pub(crate) fn draw_surfaces_anica(
             continue;
         };
 
-        // Create Y and CbCr Metal textures from the CVPixelBuffer planes.
-        let y_texture = core_video_texture_cache
-            .create_texture_from_image(
-                surface.image_buffer.as_concrete_TypeRef(),
-                None,
-                MTLPixelFormat::R8Unorm,
-                surface.image_buffer.get_width_of_plane(0),
-                surface.image_buffer.get_height_of_plane(0),
-                0,
-            )
-            .unwrap();
-        let cb_cr_texture = core_video_texture_cache
-            .create_texture_from_image(
-                surface.image_buffer.as_concrete_TypeRef(),
-                None,
-                MTLPixelFormat::RG8Unorm,
-                surface.image_buffer.get_width_of_plane(1),
-                surface.image_buffer.get_height_of_plane(1),
-                1,
-            )
-            .unwrap();
+        // Create Metal textures directly from the CVPixelBuffer IOSurface.
+        let surface_textures = match surface_kind {
+            SurfaceTextureKind::Nv12(_) => {
+                let y_texture = core_video_texture_cache
+                    .create_texture_from_image(
+                        surface.image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::R8Unorm,
+                        surface.image_buffer.get_width_of_plane(0),
+                        surface.image_buffer.get_height_of_plane(0),
+                        0,
+                    )
+                    .unwrap();
+                let cb_cr_texture = core_video_texture_cache
+                    .create_texture_from_image(
+                        surface.image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::RG8Unorm,
+                        surface.image_buffer.get_width_of_plane(1),
+                        surface.image_buffer.get_height_of_plane(1),
+                        1,
+                    )
+                    .unwrap();
+                SurfaceMetalTextures::Nv12 {
+                    y_texture,
+                    cb_cr_texture,
+                }
+            }
+            SurfaceTextureKind::Bgra => {
+                let texture = core_video_texture_cache
+                    .create_texture_from_image(
+                        surface.image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::BGRA8Unorm,
+                        surface.image_buffer.get_width(),
+                        surface.image_buffer.get_height(),
+                        0,
+                    )
+                    .unwrap();
+                SurfaceMetalTextures::Bgra { texture }
+            }
+        };
 
         // Align instance offset to 256 bytes for Metal.
         *instance_offset = (*instance_offset).div_ceil(256) * 256;
@@ -215,15 +300,44 @@ pub(crate) fn draw_surfaces_anica(
             mem::size_of_val(&texture_size) as u64,
             &texture_size as *const Size<DevicePixels> as *const _,
         );
-        command_encoder.set_fragment_texture(SurfaceInputIndex_anica::YTexture as u64, unsafe {
-            let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-            Some(metal::TextureRef::from_ptr(texture as *mut _))
-        });
-        command_encoder.set_fragment_texture(SurfaceInputIndex_anica::CbCrTexture as u64, unsafe {
-            let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-            Some(metal::TextureRef::from_ptr(texture as *mut _))
-        });
-        // Pass color range flag for YUV->RGB matrix selection.
+        match &surface_textures {
+            SurfaceMetalTextures::Nv12 {
+                y_texture,
+                cb_cr_texture,
+            } => {
+                command_encoder.set_fragment_texture(
+                    SurfaceInputIndex_anica::YTexture as u64,
+                    unsafe {
+                        let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+                        Some(metal::TextureRef::from_ptr(texture as *mut _))
+                    },
+                );
+                command_encoder.set_fragment_texture(
+                    SurfaceInputIndex_anica::CbCrTexture as u64,
+                    unsafe {
+                        let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+                        Some(metal::TextureRef::from_ptr(texture as *mut _))
+                    },
+                );
+            }
+            SurfaceMetalTextures::Bgra { texture } => {
+                command_encoder.set_fragment_texture(
+                    SurfaceInputIndex_anica::YTexture as u64,
+                    unsafe {
+                        let texture = CVMetalTextureGetTexture(texture.as_concrete_TypeRef());
+                        Some(metal::TextureRef::from_ptr(texture as *mut _))
+                    },
+                );
+                command_encoder.set_fragment_texture(
+                    SurfaceInputIndex_anica::CbCrTexture as u64,
+                    unsafe {
+                        let texture = CVMetalTextureGetTexture(texture.as_concrete_TypeRef());
+                        Some(metal::TextureRef::from_ptr(texture as *mut _))
+                    },
+                );
+            }
+        }
+        // Pass source layout/range flag for direct BGRA or YUV->RGB shader selection.
         let color_range = surface_kind.shader_flag();
         command_encoder.set_fragment_bytes(
             SurfaceInputIndex_anica::ColorRange as u64,

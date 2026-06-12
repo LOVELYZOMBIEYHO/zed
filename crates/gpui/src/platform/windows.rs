@@ -1,3 +1,4 @@
+pub(crate) mod anica_render;
 mod clipboard;
 mod destination_list;
 mod direct_write;
@@ -15,6 +16,7 @@ mod vsync;
 mod window;
 mod wrapper;
 
+pub(crate) use anica_render::*;
 pub(crate) use clipboard::*;
 pub(crate) use destination_list::*;
 pub(crate) use direct_write::*;

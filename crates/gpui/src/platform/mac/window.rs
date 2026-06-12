@@ -553,7 +553,10 @@ impl MacWindowState {
             display_link.start().log_err();
             self.display_link = Some(display_link);
             if anica_frame_source_profiler_enabled() {
-                log::info!("[GPUI][FrameSource] start_display_link display_id={}", display_id);
+                log::info!(
+                    "[GPUI][FrameSource] start_display_link display_id={}",
+                    display_id
+                );
             }
         }
     }

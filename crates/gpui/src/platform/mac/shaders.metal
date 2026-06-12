@@ -945,6 +945,10 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  constant uint *color_range
                                  [[buffer(SurfaceInputIndex_ColorRange)]]) {
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  // BGRA CVPixelBuffers are sampled directly; Metal exposes channels as RGBA.
+  if (*color_range == 2u) {
+    return y_texture.sample(texture_sampler, input.texture_position);
+  }
   // Use full-range matrix for 420f and limited-range matrix for 420v.
   float4x4 ycbcrToRGBTransform;
   if (*color_range == 0u) {
@@ -1068,6 +1072,13 @@ fragment float4 surface_fragment_anica(
   if (input.texture_position.x < 0.0 || input.texture_position.x > 1.0 ||
       input.texture_position.y < 0.0 || input.texture_position.y > 1.0) {
     discard_fragment();
+  }
+
+  // BGRA CVPixelBuffers bypass YUV conversion while keeping transform/opacity.
+  if (*color_range == 2u) {
+    float4 rgba = y_texture.sample(texture_sampler, input.texture_position);
+    rgba.a *= surfaces[0].opacity;
+    return rgba;
   }
 
   // Select full-range or limited-range YUV→RGB matrix.

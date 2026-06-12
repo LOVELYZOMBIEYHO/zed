@@ -526,6 +526,12 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     #[cfg(target_os = "windows")]
     fn get_raw_handle(&self) -> windows::HWND;
+    #[cfg(target_os = "windows")]
+    fn d3d11_devices_anica(
+        &self,
+    ) -> Option<crate::platform::windows::anica_render::D3d11Devices_anica> {
+        None
+    }
 
     // Linux specific methods
     fn inner_window_bounds(&self) -> WindowBounds {

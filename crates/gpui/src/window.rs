@@ -3296,18 +3296,14 @@ impl Window {
         });
     }
 
-    /// Paint an extended NV12 surface with opacity/transform/mask (anica).
-    /// Uses the zero-copy NV12 path with GPU-side effects, no BGRA fallback.
     #[cfg(target_os = "macos")]
-    pub fn paint_surface_anica(
+    fn paint_surface_anica_buffer(
         &mut self,
         bounds: Bounds<Pixels>,
         image_buffer: CVPixelBuffer,
         params: crate::platform::mac::anica_render::SurfaceExParams_anica,
     ) {
         use crate::platform::mac::anica_render::PaintSurface_anica;
-
-        self.invalidator.debug_assert_paint();
 
         let mut params = params;
         params.opacity = (params.opacity * self.element_opacity()).clamp(0.0, 1.0);
@@ -3322,6 +3318,74 @@ impl Window {
             image_buffer,
             params,
         });
+    }
+
+    /// Paint an extended NV12 surface with opacity/transform/mask (anica).
+    #[cfg(target_os = "macos")]
+    pub fn paint_surface_anica(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_buffer: CVPixelBuffer,
+        params: crate::platform::mac::anica_render::SurfaceExParams_anica,
+    ) {
+        self.invalidator.debug_assert_paint();
+        self.paint_surface_anica_buffer(bounds, image_buffer, params);
+    }
+
+    /// Paint a BGRA frame through the platform-native video surface path (anica).
+    #[cfg(target_os = "macos")]
+    pub fn paint_bgra_frame_anica(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        surface: crate::platform::mac::anica_render::BgraFrameSurface,
+        params: crate::platform::mac::anica_render::SurfaceExParams_anica,
+    ) {
+        use crate::platform::mac::anica_render::pixel_format_fourcc;
+
+        self.invalidator.debug_assert_paint();
+        if !surface.is_bgra() {
+            let pixel_format = surface.pixel_format();
+            log::warn!(
+                "[GPUI][BgraFrameAnica] unsupported pixel format={} (0x{pixel_format:08x}), skipping",
+                pixel_format_fourcc(pixel_format),
+            );
+            return;
+        }
+        self.paint_surface_anica_buffer(bounds, surface.into_cv_pixel_buffer(), params);
+    }
+
+    /// Paint a Windows BGRA frame through the native D3D11 texture path (anica).
+    #[cfg(target_os = "windows")]
+    pub fn paint_bgra_frame_anica(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        surface: crate::platform::windows::anica_render::BgraFrameSurface,
+        params: crate::platform::windows::anica_render::SurfaceExParams_anica,
+    ) {
+        use crate::platform::windows::anica_render::PaintBgraFrame_anica;
+
+        self.invalidator.debug_assert_paint();
+        if !surface.is_bgra() {
+            let pixel_format = surface.pixel_format();
+            log::warn!("[GPUI][BgraFrameAnica] unsupported DXGI format={pixel_format:?}, skipping");
+            return;
+        }
+
+        let mut params = params;
+        params.opacity = (params.opacity * self.element_opacity()).clamp(0.0, 1.0);
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        self.next_frame
+            .scene
+            .insert_primitive(PaintBgraFrame_anica {
+                order: 0,
+                bounds,
+                content_mask,
+                surface,
+                params,
+            });
     }
 
     /// Removes an image from the sprite atlas.
@@ -4506,6 +4570,12 @@ impl Window {
     /// Currently returns None on Mac and Windows.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.platform_window.gpu_specs()
+    }
+
+    /// Returns GPUI's Windows D3D11 device pair for native video-frame uploads.
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_devices_anica(&self) -> Option<crate::D3d11Devices_anica> {
+        self.platform_window.d3d11_devices_anica()
     }
 
     /// Perform titlebar double-click action.
