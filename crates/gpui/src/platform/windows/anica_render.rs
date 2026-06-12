@@ -1,6 +1,6 @@
 use crate::{Bounds, ContentMask, ScaledPixels};
 use windows::Win32::Graphics::{
-    Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D},
+    Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D},
     Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB},
 };
 
@@ -45,8 +45,14 @@ impl Default for SurfaceExParams_anica {
 /// Platform-native BGRA frame storage used by `paint_bgra_frame_anica`.
 #[derive(Clone, Debug)]
 pub enum BgraFrameSurface {
-    /// A Direct3D 11 BGRA texture exposed through DXGI.
-    D3d11Texture(ID3D11Texture2D),
+    /// A Direct3D 11 BGRA texture and its cached shader resource view.
+    D3d11Texture {
+        texture: ID3D11Texture2D,
+        shader_resource_view: ID3D11ShaderResourceView,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    },
 }
 
 impl BgraFrameSurface {
@@ -60,31 +66,38 @@ impl BgraFrameSurface {
 
     /// Returns the DXGI format of the wrapped texture.
     pub fn pixel_format(&self) -> DXGI_FORMAT {
-        self.desc().Format
+        match self {
+            Self::D3d11Texture { format, .. } => *format,
+        }
     }
 
     /// Returns the source texture width in pixels.
     pub fn width(&self) -> u32 {
-        self.desc().Width
+        match self {
+            Self::D3d11Texture { width, .. } => *width,
+        }
     }
 
     /// Returns the source texture height in pixels.
     pub fn height(&self) -> u32 {
-        self.desc().Height
+        match self {
+            Self::D3d11Texture { height, .. } => *height,
+        }
     }
 
     pub(crate) fn texture(&self) -> &ID3D11Texture2D {
         match self {
-            Self::D3d11Texture(texture) => texture,
+            Self::D3d11Texture { texture, .. } => texture,
         }
     }
 
-    fn desc(&self) -> D3D11_TEXTURE2D_DESC {
-        let mut desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe {
-            self.texture().GetDesc(&mut desc);
+    pub(crate) fn shader_resource_view(&self) -> &ID3D11ShaderResourceView {
+        match self {
+            Self::D3d11Texture {
+                shader_resource_view,
+                ..
+            } => shader_resource_view,
         }
-        desc
     }
 }
 

@@ -1,6 +1,8 @@
 use std::{
     mem::ManuallyDrop,
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, OnceLock},
+    time::Instant,
 };
 
 use ::util::ResultExt;
@@ -183,6 +185,22 @@ impl DirectXRenderer {
         }
     }
 
+    fn anica_bgra_timing_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("ANICA_DEBUG_FFMPEG_PREVIEW")
+                .ok()
+                .map(|raw| {
+                    let value = raw.trim();
+                    value == "1"
+                        || value.eq_ignore_ascii_case("true")
+                        || value.eq_ignore_ascii_case("yes")
+                        || value.eq_ignore_ascii_case("on")
+                })
+                .unwrap_or(false)
+        })
+    }
+
     fn pre_draw(&self) -> Result<()> {
         update_buffer(
             &self.devices.device_context,
@@ -296,6 +314,9 @@ impl DirectXRenderer {
     }
 
     pub(crate) fn draw(&mut self, scene: &Scene) -> Result<()> {
+        let debug_anica_bgra = Self::anica_bgra_timing_enabled();
+        let bgra_frame_count = scene.bgra_frames_anica.len();
+        let draw_started = debug_anica_bgra.then_some(()).map(|_| Instant::now());
         self.pre_draw()?;
         for batch in scene.batches() {
             match batch {
@@ -329,7 +350,26 @@ impl DirectXRenderer {
                     scene.polychrome_sprites.len(),
                     scene.surfaces.len(),))?;
         }
-        self.present()
+        let batches_us = draw_started.map(|started| started.elapsed().as_micros());
+        let present_started = debug_anica_bgra.then_some(()).map(|_| Instant::now());
+        let result = self.present();
+        if debug_anica_bgra && bgra_frame_count > 0 {
+            let present_us = present_started
+                .map(|started| started.elapsed().as_micros())
+                .unwrap_or_default();
+            static WINDOWS_BGRA_PRESENT_TIMING_COUNT: AtomicU64 = AtomicU64::new(0);
+            let hit = WINDOWS_BGRA_PRESENT_TIMING_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if hit <= 20 || hit % 60 == 0 {
+                log::info!(
+                    "[GPUI][BgraFrameAnica] present_timing hit={} bgra_frames={} draw_batches_ms={:.2} present_ms={:.2}",
+                    hit,
+                    bgra_frame_count,
+                    batches_us.unwrap_or_default() as f64 / 1000.0,
+                    present_us as f64 / 1000.0,
+                );
+            }
+        }
+        result
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -622,7 +662,10 @@ impl DirectXRenderer {
             return Ok(());
         }
 
+        let debug_anica_bgra = Self::anica_bgra_timing_enabled();
         for frame in frames {
+            let total_started = debug_anica_bgra.then_some(()).map(|_| Instant::now());
+            let instance_started = debug_anica_bgra.then_some(()).map(|_| Instant::now());
             let instance = [BgraFrameBounds_anica {
                 bounds: frame.bounds,
                 content_mask: frame.content_mask.clone(),
@@ -639,19 +682,14 @@ impl DirectXRenderer {
                 &self.devices.device_context,
                 &instance,
             )?;
+            let instance_us = instance_started
+                .map(|started| started.elapsed().as_micros())
+                .unwrap_or_default();
 
-            let mut texture_view = None;
-            unsafe {
-                self.devices
-                    .device
-                    .CreateShaderResourceView(
-                        frame.surface.texture(),
-                        None,
-                        Some(&mut texture_view),
-                    )
-                    .context("Creating BGRA frame shader resource view")?;
-            }
-            let texture_view = [Some(texture_view.unwrap())];
+            // The SRV is created by the texture ring and reused here to avoid
+            // expensive per-frame D3D resource creation.
+            let texture_view = [Some(frame.surface.shader_resource_view().clone())];
+            let draw_started = debug_anica_bgra.then_some(()).map(|_| Instant::now());
             self.pipelines.bgra_frames_anica.draw_with_texture(
                 &self.devices.device_context,
                 &texture_view,
@@ -660,6 +698,27 @@ impl DirectXRenderer {
                 &self.globals.sampler,
                 1,
             )?;
+            if debug_anica_bgra {
+                let draw_us = draw_started
+                    .map(|started| started.elapsed().as_micros())
+                    .unwrap_or_default();
+                let total_us = total_started
+                    .map(|started| started.elapsed().as_micros())
+                    .unwrap_or_default();
+                static WINDOWS_BGRA_DRAW_TIMING_COUNT: AtomicU64 = AtomicU64::new(0);
+                let hit = WINDOWS_BGRA_DRAW_TIMING_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if hit <= 20 || hit % 60 == 0 {
+                    log::info!(
+                        "[GPUI][BgraFrameAnica] draw_timing hit={} frame={}x{} instance_ms={:.2} bind_draw_ms={:.2} total_ms={:.2}",
+                        hit,
+                        frame.surface.width(),
+                        frame.surface.height(),
+                        instance_us as f64 / 1000.0,
+                        draw_us as f64 / 1000.0,
+                        total_us as f64 / 1000.0,
+                    );
+                }
+            }
         }
         Ok(())
     }
