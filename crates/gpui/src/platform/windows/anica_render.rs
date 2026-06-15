@@ -47,15 +47,95 @@ impl Default for SurfaceExParams_anica {
 pub enum BgraFrameSurface {
     /// A Direct3D 11 BGRA texture and its cached shader resource view.
     D3d11Texture {
+        /// The D3D11 texture.
         texture: ID3D11Texture2D,
+        /// Cached shader resource view for sampling the texture.
         shader_resource_view: ID3D11ShaderResourceView,
+        /// Texture width in pixels.
         width: u32,
+        /// Texture height in pixels.
         height: u32,
+        /// DXGI format of the texture.
         format: DXGI_FORMAT,
     },
 }
 
 impl BgraFrameSurface {
+    /// Open a DXGI shared handle on the given GPUI D3D11 device and wrap it as a
+    /// `BgraFrameSurface`. Returns `None` if the handle cannot be opened or the
+    /// shader resource view cannot be created.
+    pub fn from_shared_handle(
+        devices: &D3d11Devices_anica,
+        shared_handle: isize,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    ) -> Option<Self> {
+        Self::from_shared_handle_internal(devices, shared_handle, width, height, format)
+    }
+
+    /// Convenience constructor for the common BGRA8_UNORM preview surface format.
+    pub fn from_shared_handle_bgra(
+        devices: &D3d11Devices_anica,
+        shared_handle: isize,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        Self::from_shared_handle_internal(
+            devices,
+            shared_handle,
+            width,
+            height,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+        )
+    }
+
+    fn from_shared_handle_internal(
+        devices: &D3d11Devices_anica,
+        shared_handle: isize,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    ) -> Option<Self> {
+        if shared_handle == 0 {
+            return None;
+        }
+        unsafe {
+            use windows::Win32::Foundation::HANDLE;
+            let mut texture: Option<ID3D11Texture2D> = None;
+            devices
+                .device
+                .OpenSharedResource(
+                    HANDLE(shared_handle as *mut core::ffi::c_void),
+                    &mut texture,
+                )
+                .ok()?;
+            let texture = texture?;
+            let mut desc = Default::default();
+            texture.GetDesc(&mut desc);
+            if desc.Width != width
+                || desc.Height != height
+                || desc.Format != format
+                || desc.MipLevels != 1
+                || desc.ArraySize != 1
+            {
+                return None;
+            }
+            let mut shader_resource_view = None;
+            devices
+                .device
+                .CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))
+                .ok()?;
+            Some(Self::D3d11Texture {
+                texture,
+                shader_resource_view: shader_resource_view?,
+                width,
+                height,
+                format,
+            })
+        }
+    }
+
     /// Returns true when the wrapped platform surface is a BGRA texture.
     pub fn is_bgra(&self) -> bool {
         matches!(
