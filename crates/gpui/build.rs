@@ -203,6 +203,13 @@ mod macos {
         let air_output_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.air");
         let metallib_output_path =
             PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.metallib");
+        let module_cache_path =
+            PathBuf::from(env::var("OUT_DIR").unwrap()).join("metal-module-cache");
+        std::fs::create_dir_all(&module_cache_path).unwrap();
+        let module_cache_arg = format!(
+            "-fmodules-cache-path={}",
+            module_cache_path.to_str().unwrap()
+        );
         println!("cargo:rerun-if-changed={}", shader_path);
 
         let output = Command::new("xcrun")
@@ -215,6 +222,7 @@ mod macos {
                 "-MO",
                 "-c",
                 shader_path,
+                module_cache_arg.as_str(),
                 "-include",
                 (header_path.to_str().unwrap()),
                 "-o",
